@@ -1,0 +1,15 @@
+# Ignore everything at root level
+/*
+
+# Except the project directory and this gitignore
+!/.gitignore
+!/finspark-download/
+
+# Explicitly ignore common generated dirs
+node_modules/
+*.png
+*.jpg
+figma_*/
+figma_*.png
+
+# Inside finspark-download, use its own .gitignore
