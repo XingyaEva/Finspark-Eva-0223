@@ -1,0 +1,41 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "genspark-financial-analysis",
+  "compatibility_date": "2024-12-01",
+  "pages_build_output_dir": "./dist",
+  "compatibility_flags": ["nodejs_compat"],
+  
+  // 启用 Workers Unbound 模式（需要 Cloudflare Workers Paid 计划）
+  // 允许更长的 CPU 执行时间（最高30秒），适合漫画生成等计算密集型任务
+  // 如果您使用的是免费计划，请注释掉此行
+  // "usage_model": "unbound",
+
+  // D1 数据库（股票数据、用户数据、分析报告持久化）
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "genspark-financial-db",
+      "database_id": "af997515-df86-457d-bec1-f29e634f2a90"
+    }
+  ],
+
+  // KV 缓存存储（Tushare 数据缓存和分析结果临时存储）
+  "kv_namespaces": [
+    {
+      "binding": "CACHE",
+      "id": "285fe51274154c798eaccafd90489666"
+    }
+  ]
+
+  // 环境变量已在 Cloudflare Dashboard 中配置:
+  // - AKSHARE_PROXY_URL: http://47.110.92.210:8000
+  // - VECTORENGINE_API_KEY, TUSHARE_TOKEN, JWT_SECRET 等
+
+  // R2 存储（用于漫画图片等文件 - 后续添加）
+  // "r2_buckets": [
+  //   {
+  //     "binding": "STORAGE",
+  //     "bucket_name": "genspark-financial-storage"
+  //   }
+  // ]
+}

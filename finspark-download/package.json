@@ -1,0 +1,57 @@
+{
+  "name": "finspark-investment-analysis",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:sandbox": "wrangler pages dev dist --d1=genspark-financial-db --ip 0.0.0.0 --port 3000",
+    "dev:init": "npm run db:init && npm run dev:sandbox",
+    "start": "npm run build && npm run db:init && npm run dev:sandbox",
+    "build": "vite build",
+    "preview": "wrangler pages dev --d1=genspark-financial-db",
+    "deploy": "npm run build && wrangler pages deploy dist",
+    "deploy:prod": "npm run build && wrangler pages deploy dist --project-name finspark-financial",
+    "cf-typegen": "wrangler types --env-interface CloudflareBindings",
+    "clean-port": "fuser -k 3000/tcp 2>/dev/null || true",
+    
+    "db:init": "node scripts/db-init.mjs",
+    "db:init:full": "node scripts/db-init.mjs --full --skip-sync",
+    "db:init:sync": "node scripts/db-init.mjs --full --sync-all",
+    "db:init:all": "node scripts/db-init.mjs --full --sync-all",
+    "db:migrate:local": "wrangler d1 migrations apply genspark-financial-db --local",
+    "db:migrate:prod": "wrangler d1 migrations apply genspark-financial-db",
+    "db:migrate:all": "wrangler d1 execute genspark-financial-db --local --file=./scripts/all_migrations.sql",
+    "db:seed": "wrangler d1 execute genspark-financial-db --local --file=./seed.sql",
+    "db:seed:more": "wrangler d1 execute genspark-financial-db --local --file=./seed_more_stocks.sql",
+    "db:seed:all": "npm run db:seed && npm run db:seed:more",
+    "db:reset": "rm -rf .wrangler/state/v3/d1 && npm run db:migrate:local && npm run db:seed:all",
+    "db:reset:full": "rm -rf .wrangler/state/v3/d1 && npm run db:migrate:all && npm run db:seed:all",
+    "db:console": "wrangler d1 execute genspark-financial-db --local",
+    "db:status": "wrangler d1 execute genspark-financial-db --local --command='SELECT COUNT(*) as count FROM stocks;'",
+    "db:tables": "wrangler d1 execute genspark-financial-db --local --command=\"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;\"",
+    
+    "sync:stocks": "node scripts/sync_all_stocks.mjs",
+    "sync:stocks:a": "node scripts/sync_all_stocks.mjs --a-stock --full --hot",
+    "sync:stocks:hk": "node scripts/sync_hk_stocks.mjs --full --hot",
+    "sync:stocks:all": "npm run sync:stocks:a && npm run sync:stocks:hk",
+    "sync:stocks:prod": "node scripts/sync_all_stocks.mjs --a-stock --full --hot --prod && node scripts/sync_hk_stocks.mjs --full --hot --prod",
+    "sync:stocks:prod:hk": "node scripts/sync_hk_stocks.mjs --full --hot --prod",
+    "sync:stocks:prod:a": "node scripts/sync_all_stocks.mjs --a-stock --full --hot --prod",
+    "sync:dry-run": "node scripts/sync_all_stocks.mjs --full --dry-run",
+    "sync:hk:dry-run": "node scripts/sync_hk_stocks.mjs --full --dry-run",
+    "sync:a-full": "node scripts/sync_all_stocks.mjs --a-stock --full --hot"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "hono": "^4.11.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251213.0",
+    "@hono/vite-build": "^1.2.0",
+    "@hono/vite-dev-server": "^0.18.2",
+    "http-proxy": "^1.18.1",
+    "typescript": "^5.9.3",
+    "vite": "^6.3.5",
+    "wrangler": "^4.4.0",
+    "xlsx": "^0.18.5"
+  }
+}

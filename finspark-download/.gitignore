@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment files
+.dev.vars
+.dev.vars.deploy
+.wrangler/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Archives
+*.tar.gz
+
+# Local exports
+export/
+core/
+
+# Temporary files
+*.tmp
+*.bak
+
+# Lock files (optional, can be tracked)
+# package-lock.json
+core
+../finspark-complete-package0116.tar

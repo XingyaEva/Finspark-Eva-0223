@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ECharts Test</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            padding: 20px;
+            background: #1a1a1a;
+            color: white;
+        }
+        #test-chart {
+            width: 800px;
+            height: 400px;
+            background: #2a2a2a;
+            border: 1px solid #444;
+        }
+        .info {
+            margin: 20px 0;
+            padding: 15px;
+            background: #2a2a2a;
+            border-left: 4px solid #4CAF50;
+        }
+        .error {
+            border-left-color: #f44336;
+        }
+    </style>
+</head>
+<body>
+    <h1>ECharts CDN 加载测试</h1>
+    
+    <div id="status" class="info">
+        <h3>加载状态检查中...</h3>
+        <div id="echarts-status"></div>
+        <div id="api-status"></div>
+    </div>
+    
+    <h2>测试图表</h2>
+    <div id="test-chart"></div>
+    
+    <div id="logs" style="margin-top: 20px; padding: 10px; background: #000; font-family: monospace; font-size: 12px;">
+        <strong>Console Logs:</strong><br>
+    </div>
+    
+    <script>
+        const logs = document.getElementById('logs');
+        const log = (msg, isError = false) => {
+            const time = new Date().toLocaleTimeString();
+            const color = isError ? 'red' : '#4CAF50';
+            logs.innerHTML += `<div style="color: ${color}">[${time}] ${msg}</div>`;
+            console.log(`[Test] ${msg}`);
+        };
+        
+        // 1. 检查 ECharts 是否加载
+        log('Step 1: 检查 ECharts 是否加载');
+        if (typeof echarts !== 'undefined') {
+            log(`✅ ECharts 已加载，版本: ${echarts.version}`);
+            document.getElementById('echarts-status').innerHTML = 
+                `<p style="color: #4CAF50">✅ ECharts CDN 加载成功<br>版本: ${echarts.version}</p>`;
+        } else {
+            log('❌ ECharts 未加载', true);
+            document.getElementById('echarts-status').innerHTML = 
+                `<p style="color: #f44336">❌ ECharts CDN 加载失败</p>`;
+            document.getElementById('status').classList.add('error');
+        }
+        
+        // 2. 测试绘制图表
+        if (typeof echarts !== 'undefined') {
+            log('Step 2: 尝试绘制测试图表');
+            try {
+                const chartDom = document.getElementById('test-chart');
+                const myChart = echarts.init(chartDom);
+                
+                const option = {
+                    title: {
+                        text: 'ECharts 测试图表',
+                        textStyle: { color: '#fff' }
+                    },
+                    tooltip: {},
+                    xAxis: {
+                        data: ['Q1', 'Q2', 'Q3', 'Q4'],
+                        axisLabel: { color: '#fff' }
+                    },
+                    yAxis: {
+                        axisLabel: { color: '#fff' }
+                    },
+                    series: [{
+                        name: '营收',
+                        type: 'bar',
+                        data: [120, 200, 150, 180],
+                        itemStyle: { color: '#4CAF50' }
+                    }]
+                };
+                
+                myChart.setOption(option);
+                log('✅ 图表绘制成功');
+            } catch (err) {
+                log(`❌ 图表绘制失败: ${err.message}`, true);
+            }
+        }
+        
+        // 3. 测试 API 调用
+        log('Step 3: 测试 API 调用');
+        fetch('/api/chart/financial/600519.SH')
+            .then(response => {
+                log(`API 响应状态: ${response.status}`);
+                return response.json();
+            })
+            .then(data => {
+                if (data.success) {
+                    log(`✅ API 调用成功`);
+                    log(`数据: income=${data.data.income?.length}条, fina=${data.data.finaIndicator?.length}条`);
+                    document.getElementById('api-status').innerHTML = 
+                        `<p style="color: #4CAF50">✅ API 调用成功<br>收入数据: ${data.data.income?.length}条<br>财务指标: ${data.data.finaIndicator?.length}条</p>`;
+                } else {
+                    log(`❌ API 返回错误: ${data.error}`, true);
+                    document.getElementById('api-status').innerHTML = 
+                        `<p style="color: #f44336">❌ API 返回错误: ${data.error}</p>`;
+                    document.getElementById('status').classList.add('error');
+                }
+            })
+            .catch(err => {
+                log(`❌ API 调用失败: ${err.message}`, true);
+                document.getElementById('api-status').innerHTML = 
+                    `<p style="color: #f44336">❌ API 调用失败: ${err.message}</p>`;
+                document.getElementById('status').classList.add('error');
+            });
+            
+        // 4. 检查 DOM 元素
+        log('Step 4: 检查关键 DOM 元素');
+        setTimeout(() => {
+            const mainAnalysisSection = document.getElementById('mainFinancialChart');
+            if (mainAnalysisSection) {
+                log('✅ 找到主图表容器');
+            } else {
+                log('ℹ️ 这是测试页面，没有主图表容器（正常）');
+            }
+        }, 100);
+        
+        log('--- 测试完成 ---');
+        log('如果看到上面的 ✅ 标记，说明 ECharts 和 API 都工作正常');
+        log('如果分析页面仍然没有图表，问题可能在前端 JavaScript 执行流程');
+    </script>
+</body>
+</html>
