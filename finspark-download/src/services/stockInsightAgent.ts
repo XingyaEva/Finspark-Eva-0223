@@ -236,17 +236,10 @@ export class StockInsightAgent {
       console.log('[StockInsightAgent] 开始生成解读:', input.stockCode);
       
       // 调用 LLM
-      const response = await this.vectorEngine.chat({
-        messages: [
-          {
-            role: 'user',
-            content: prompt,
-          },
-        ],
-        model: 'deepseek-chat',  // 使用 DeepSeek 模型
-        temperature: 0.7,
-        max_tokens: 2000,
-      });
+      const response = await this.vectorEngine.chat(
+        [{ role: 'user' as const, content: prompt }],
+        { model: 'deepseek-chat', temperature: 0.7, maxTokens: 2000 }
+      );
       
       // 解析响应
       const content = response.choices?.[0]?.message?.content || '';

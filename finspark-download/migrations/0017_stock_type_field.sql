@@ -3,12 +3,10 @@
 -- 日期: 2026-01-16
 -- 说明: 支持全量 A 股数据同步 (5400+)
 
--- 添加 stock_type 字段
+-- 添加 stock_type 字段 (使用 IF NOT EXISTS 兼容重复执行)
 ALTER TABLE stocks ADD COLUMN stock_type TEXT DEFAULT 'A';
-
--- 添加港股相关字段（为将来港股接入做准备）
-ALTER TABLE stocks ADD COLUMN lot_size INTEGER DEFAULT 100;       -- 每手股数
-ALTER TABLE stocks ADD COLUMN hk_stock_connect INTEGER DEFAULT 0;  -- 是否港股通标的
+ALTER TABLE stocks ADD COLUMN lot_size INTEGER DEFAULT 100;
+ALTER TABLE stocks ADD COLUMN hk_stock_connect INTEGER DEFAULT 0;
 
 -- 创建索引
 CREATE INDEX IF NOT EXISTS idx_stocks_stock_type ON stocks(stock_type);

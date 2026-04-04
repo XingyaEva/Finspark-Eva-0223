@@ -5,6 +5,7 @@ export interface UserPreferences {
   // 分析偏好
   defaultReportType: 'annual' | 'quarterly' | 'all';
   analysisDepth: 'quick' | 'standard' | 'deep';
+  analysisStyle: 'balanced' | 'prudent' | 'decisive' | 'risk_aware';
   includeComic: boolean;
   includeForecast: boolean;
   includeIndustryCompare: boolean;
@@ -37,6 +38,7 @@ export interface PreferencesUpdateInput {
 export const DEFAULT_PREFERENCES: UserPreferences = {
   defaultReportType: 'annual',
   analysisDepth: 'standard',
+  analysisStyle: 'balanced',
   includeComic: true,
   includeForecast: true,
   includeIndustryCompare: true,
@@ -61,6 +63,7 @@ export const DEFAULT_PREFERENCES: UserPreferences = {
 const DB_TO_INTERFACE_MAP: Record<string, string> = {
   default_report_type: 'defaultReportType',
   analysis_depth: 'analysisDepth',
+  analysis_style: 'analysisStyle',
   include_comic: 'includeComic',
   include_forecast: 'includeForecast',
   include_industry_compare: 'includeIndustryCompare',

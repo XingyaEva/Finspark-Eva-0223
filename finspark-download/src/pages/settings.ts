@@ -1,5 +1,6 @@
 // 用户设置页面
 // 包含偏好设置、账户管理、通知设置等
+// 响应式优化: 移动端导航栏、选项卡滚动、卡片布局、touch-friendly 控件
 import { responsiveStyles } from '../styles/responsive';
 
 export const settingsPageHtml = `
@@ -17,35 +18,153 @@ export const settingsPageHtml = `
         .gold-text { color: #d4af37; }
         .gold-gradient { background: linear-gradient(135deg, #d4af37 0%, #f5d17e 50%, #d4af37 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
         .card { background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(212, 175, 55, 0.2); }
-        .btn-gold { background: linear-gradient(135deg, #d4af37 0%, #f5d17e 100%); color: #0a0a0a; font-weight: 600; }
-        .btn-outline { border: 1px solid rgba(212, 175, 55, 0.5); color: #d4af37; }
+        .btn-gold { background: linear-gradient(135deg, #d4af37 0%, #f5d17e 100%); color: #0a0a0a; font-weight: 600; transition: all 0.3s; }
+        .btn-gold:hover { transform: scale(1.02); }
+        .btn-outline { border: 1px solid rgba(212, 175, 55, 0.5); color: #d4af37; transition: all 0.3s; }
         .btn-outline:hover { background: rgba(212, 175, 55, 0.1); }
-        .setting-card { background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); transition: all 0.3s; }
+        .setting-card { background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); transition: all 0.3s; border-radius: 12px; }
         .setting-card:hover { border-color: rgba(212, 175, 55, 0.3); }
-        .toggle-switch { position: relative; width: 48px; height: 26px; }
+
+        /* Toggle switch - touch-friendly sizing */
+        .toggle-switch { position: relative; width: 48px; height: 26px; flex-shrink: 0; }
         .toggle-switch input { opacity: 0; width: 0; height: 0; }
         .toggle-slider { position: absolute; cursor: pointer; inset: 0; background: #374151; border-radius: 13px; transition: 0.3s; }
         .toggle-slider:before { content: ''; position: absolute; height: 20px; width: 20px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: 0.3s; }
         .toggle-switch input:checked + .toggle-slider { background: #d4af37; }
         .toggle-switch input:checked + .toggle-slider:before { transform: translateX(22px); }
-        .select-custom { background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; }
+
+        /* Select dropdown - responsive */
+        .select-custom {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            font-size: 14px;
+            min-width: 120px;
+            -webkit-appearance: none;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 12px center;
+            padding-right: 2rem;
+        }
         .select-custom:focus { border-color: #d4af37; outline: none; box-shadow: 0 0 0 2px rgba(212, 175, 55, 0.2); }
-        .nav-tab { padding: 12px 24px; color: #9ca3af; border-bottom: 2px solid transparent; cursor: pointer; transition: all 0.2s; }
+        .select-custom option { background: #1a1a2e; color: white; }
+
+        /* Tab navigation - scrollable on mobile */
+        .nav-tabs-container {
+            display: flex;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            margin-bottom: 1.5rem;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-width: none;
+            -ms-overflow-style: none;
+        }
+        .nav-tabs-container::-webkit-scrollbar { display: none; }
+        .nav-tab {
+            padding: 12px 20px;
+            color: #9ca3af;
+            border-bottom: 2px solid transparent;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+            user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
         .nav-tab:hover { color: #d4af37; }
-        .nav-tab.active { color: #d4af37; border-bottom-color: #d4af37; }
+        .nav-tab.active { color: #d4af37; border-bottom-color: #d4af37; font-weight: 500; }
+
+        /* Setting item layout - stack on mobile */
+        .setting-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+        }
+        .setting-item-info {
+            flex: 1;
+            min-width: 0;
+        }
+        .setting-item-info h3 {
+            font-size: 15px;
+            font-weight: 500;
+            color: #e5e7eb;
+            margin-bottom: 2px;
+        }
+        .setting-item-info p {
+            font-size: 13px;
+            color: #6b7280;
+            line-height: 1.4;
+        }
+
+        /* Toast animation */
         .toast { animation: slideIn 0.3s ease; }
         @keyframes slideIn { from { transform: translateY(100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+
+        /* Save indicator */
+        .save-indicator {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            padding: 10px 16px;
+            background: rgba(16, 185, 129, 0.15);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            color: #10b981;
+            border-radius: 10px;
+            font-size: 14px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            z-index: 100;
+            backdrop-filter: blur(10px);
+        }
+
+        /* Mobile responsive overrides */
+        @media (max-width: 639px) {
+            .nav-tab { padding: 10px 14px; font-size: 13px; }
+            .setting-card { padding: 16px; }
+            .select-custom { min-width: 110px; font-size: 13px; padding: 8px 12px; padding-right: 28px; }
+            .setting-item { gap: 12px; }
+            .setting-item-info h3 { font-size: 14px; }
+            .setting-item-info p { font-size: 12px; }
+            .save-indicator { bottom: 16px; right: 16px; left: 16px; text-align: center; }
+            /* Stack agent config card on very small screens */
+            .agent-config-card .flex.items-center.gap-4 { gap: 12px; }
+            .agent-config-card .w-12 { width: 40px; height: 40px; min-width: 40px; }
+            .agent-config-card .w-12 i { font-size: 14px; }
+        }
+
+        /* Touch device optimizations */
+        @media (hover: none) and (pointer: coarse) {
+            .toggle-switch { width: 52px; height: 28px; }
+            .toggle-slider:before { height: 22px; width: 22px; }
+            .toggle-switch input:checked + .toggle-slider:before { transform: translateX(24px); }
+            .setting-card { padding: 18px; }
+            .nav-tab { padding: 12px 16px; min-height: 44px; }
+        }
+
         \${responsiveStyles}
     </style>
 </head>
 <body class="text-white">
     <!-- 桌面端导航栏 -->
-    <nav class="fixed top-0 left-0 right-0 z-50 px-6 py-4 backdrop-blur-md bg-black/30 border-b border-gray-800 hide-on-mobile">
+    <nav class="fixed top-0 left-0 right-0 z-50 px-6 py-4 backdrop-blur-md bg-black/80 border-b border-gray-800 hide-on-mobile">
         <div class="container-adaptive flex justify-between items-center">
-            <a href="/" class="text-2xl font-bold gold-gradient">Finspark</a>
-            <div class="flex items-center space-x-4">
+            <a href="/" class="flex items-center space-x-2 text-decoration-none" style="text-decoration:none;">
+                <i class="fas fa-chart-line text-xl gold-text"></i>
+                <span class="text-xl font-bold gold-gradient">Finspark</span>
+            </a>
+            <div class="flex items-center space-x-6">
+                <a href="/" class="text-gray-400 hover:text-white transition">首页</a>
+                <a href="/account" class="text-gray-400 hover:text-white transition">个人中心</a>
                 <a href="/membership" class="text-gray-400 hover:text-white transition">会员中心</a>
-                <a href="/" class="btn-gold px-4 py-2 rounded-lg text-sm">
+                <a href="/" class="btn-gold px-4 py-2 rounded-lg text-sm" style="text-decoration:none;">
                     <i class="fas fa-chart-line mr-2"></i>开始分析
                 </a>
             </div>
@@ -53,14 +172,17 @@ export const settingsPageHtml = `
     </nav>
     
     <!-- 移动端导航栏 -->
-    <nav class="mobile-nav show-on-mobile backdrop-blur-md bg-black/30 border-b border-gray-800">
+    <nav class="mobile-nav show-on-mobile backdrop-blur-md bg-black/80 border-b border-gray-800">
         <div class="px-4 py-3 flex items-center justify-between">
-            <a href="/" class="text-xl font-bold gold-gradient">Finspark</a>
-            <div class="flex items-center space-x-2">
-                <a href="/membership" class="p-2 text-gray-400 hover:text-white touch-target">
-                    <i class="fas fa-crown text-lg"></i>
+            <a href="/" class="flex items-center space-x-2" style="text-decoration:none;">
+                <i class="fas fa-chart-line text-xl gold-text"></i>
+                <span class="text-lg font-bold gold-gradient">Finspark</span>
+            </a>
+            <div class="flex items-center space-x-1">
+                <a href="/account" class="p-2 text-gray-400 hover:text-white touch-target" title="个人中心">
+                    <i class="fas fa-user-circle text-lg"></i>
                 </a>
-                <a href="/" class="p-2 text-gray-400 hover:text-white touch-target">
+                <a href="/" class="p-2 text-gray-400 hover:text-white touch-target" title="首页">
                     <i class="fas fa-home text-lg"></i>
                 </a>
             </div>
@@ -70,24 +192,35 @@ export const settingsPageHtml = `
     <main class="pt-adaptive-header pb-8 md:pb-16">
         <div class="container-adaptive" style="max-width: 768px;">
             <!-- 页面标题 -->
-            <div class="mb-6 md:mb-8">
-                <h1 class="text-2xl md:text-3xl font-bold gold-gradient mb-2">设置</h1>
+            <div class="mb-4 md:mb-8">
+                <div class="flex items-center gap-3 mb-2">
+                    <a href="/account" class="text-gray-500 hover:text-gray-300 transition text-sm" style="text-decoration:none;">
+                        <i class="fas fa-arrow-left mr-1"></i>个人中心
+                    </a>
+                </div>
+                <h1 class="text-2xl md:text-3xl font-bold gold-gradient mb-1">
+                    <i class="fas fa-cog mr-2"></i>设置
+                </h1>
                 <p class="text-gray-400 text-sm md:text-base">管理您的偏好设置和账户信息</p>
             </div>
             
             <!-- 选项卡导航 -->
-            <div class="flex border-b border-gray-800 mb-4 md:mb-6 overflow-x-auto -mx-4 px-4 md:mx-0 md:px-0">
-                <div class="nav-tab active whitespace-nowrap text-sm md:text-base" onclick="switchTab('analysis')">
-                    <i class="fas fa-chart-pie mr-1 md:mr-2"></i><span class="hidden sm:inline">分析</span>偏好
+            <div class="nav-tabs-container">
+                <div class="nav-tab active" onclick="switchTab('analysis', this)">
+                    <i class="fas fa-chart-pie"></i>
+                    <span>分析偏好</span>
                 </div>
-                <div class="nav-tab whitespace-nowrap text-sm md:text-base" onclick="switchTab('appearance')">
-                    <i class="fas fa-palette mr-1 md:mr-2"></i><span class="hidden sm:inline">外观</span>主题
+                <div class="nav-tab" onclick="switchTab('appearance', this)">
+                    <i class="fas fa-palette"></i>
+                    <span>外观主题</span>
                 </div>
-                <div class="nav-tab whitespace-nowrap text-sm md:text-base" onclick="switchTab('notifications')">
-                    <i class="fas fa-bell mr-1 md:mr-2"></i>通知<span class="hidden sm:inline">设置</span>
+                <div class="nav-tab" onclick="switchTab('notifications', this)">
+                    <i class="fas fa-bell"></i>
+                    <span>通知设置</span>
                 </div>
-                <div class="nav-tab whitespace-nowrap text-sm md:text-base" onclick="switchTab('account')">
-                    <i class="fas fa-user-cog mr-1 md:mr-2"></i>账户<span class="hidden sm:inline">管理</span>
+                <div class="nav-tab" onclick="switchTab('account', this)">
+                    <i class="fas fa-user-cog"></i>
+                    <span>账户管理</span>
                 </div>
             </div>
             
@@ -110,30 +243,30 @@ export const settingsPageHtml = `
             </div>
             
             <!-- 设置内容 -->
-            <div id="settingsContent" class="hidden space-y-6">
+            <div id="settingsContent" class="hidden space-y-4 md:space-y-6">
                 <!-- 分析偏好 -->
-                <div id="tab-analysis" class="space-y-4">
+                <div id="tab-analysis" class="space-y-3 md:space-y-4">
                     <!-- Agent 配置入口 -->
-                    <a href="/settings/agents" class="setting-card rounded-xl p-5 block hover:border-yellow-500/50 cursor-pointer">
+                    <a href="/settings/agents" class="agent-config-card setting-card p-4 md:p-5 block cursor-pointer" style="text-decoration:none;border-color:rgba(212,175,55,0.2);">
                         <div class="flex items-center justify-between">
-                            <div class="flex items-center gap-4">
-                                <div class="w-12 h-12 rounded-full bg-gradient-to-r from-yellow-600 to-orange-600 flex items-center justify-center">
-                                    <i class="fas fa-robot text-white text-lg"></i>
+                            <div class="flex items-center gap-3 md:gap-4">
+                                <div class="w-10 h-10 md:w-12 md:h-12 rounded-full bg-gradient-to-r from-yellow-600 to-orange-600 flex items-center justify-center flex-shrink-0">
+                                    <i class="fas fa-robot text-white text-base md:text-lg"></i>
                                 </div>
                                 <div>
-                                    <h3 class="font-semibold gold-text">Agent 配置中心</h3>
-                                    <p class="text-sm text-gray-400 mt-1">自定义 AI Agent 的模型偏好、分析深度和高级参数</p>
+                                    <h3 class="font-semibold gold-text text-sm md:text-base">Agent 配置中心</h3>
+                                    <p class="text-xs md:text-sm text-gray-400 mt-0.5 md:mt-1">自定义 AI Agent 的模型偏好、分析深度和高级参数</p>
                                 </div>
                             </div>
-                            <i class="fas fa-chevron-right text-gray-500"></i>
+                            <i class="fas fa-chevron-right text-gray-500 flex-shrink-0 ml-2"></i>
                         </div>
                     </a>
                     
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between mb-4">
-                            <div>
-                                <h3 class="font-semibold">默认报告类型</h3>
-                                <p class="text-sm text-gray-400 mt-1">选择默认分析的财报类型</p>
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3>默认报告类型</h3>
+                                <p>选择默认分析的财报类型</p>
                             </div>
                             <select id="defaultReportType" class="select-custom" onchange="updatePreference('defaultReportType', this.value)">
                                 <option value="annual">年度报告</option>
@@ -143,11 +276,11 @@ export const settingsPageHtml = `
                         </div>
                     </div>
                     
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between mb-4">
-                            <div>
-                                <h3 class="font-semibold">分析深度</h3>
-                                <p class="text-sm text-gray-400 mt-1">选择分析的详细程度</p>
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3>分析深度</h3>
+                                <p>选择分析的详细程度</p>
                             </div>
                             <select id="analysisDepth" class="select-custom" onchange="updatePreference('analysisDepth', this.value)">
                                 <option value="quick">快速分析</option>
@@ -157,11 +290,11 @@ export const settingsPageHtml = `
                         </div>
                     </div>
                     
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between">
-                            <div>
-                                <h3 class="font-semibold">包含漫画解读</h3>
-                                <p class="text-sm text-gray-400 mt-1">默认生成AI漫画解读版</p>
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3>包含漫画解读</h3>
+                                <p>默认生成AI漫画解读版</p>
                             </div>
                             <label class="toggle-switch">
                                 <input type="checkbox" id="includeComic" onchange="updatePreference('includeComic', this.checked)">
@@ -170,11 +303,11 @@ export const settingsPageHtml = `
                         </div>
                     </div>
                     
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between">
-                            <div>
-                                <h3 class="font-semibold">包含业绩预测</h3>
-                                <p class="text-sm text-gray-400 mt-1">默认包含未来业绩预测分析</p>
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3>包含业绩预测</h3>
+                                <p>默认包含未来业绩预测分析</p>
                             </div>
                             <label class="toggle-switch">
                                 <input type="checkbox" id="includeForecast" onchange="updatePreference('includeForecast', this.checked)">
@@ -183,11 +316,11 @@ export const settingsPageHtml = `
                         </div>
                     </div>
                     
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between">
-                            <div>
-                                <h3 class="font-semibold">包含行业对比</h3>
-                                <p class="text-sm text-gray-400 mt-1">默认包含同行业公司对比</p>
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3>包含行业对比</h3>
+                                <p>默认包含同行业公司对比</p>
                             </div>
                             <label class="toggle-switch">
                                 <input type="checkbox" id="includeIndustryCompare" onchange="updatePreference('includeIndustryCompare', this.checked)">
@@ -196,11 +329,11 @@ export const settingsPageHtml = `
                         </div>
                     </div>
                     
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between mb-4">
-                            <div>
-                                <h3 class="font-semibold">默认导出格式</h3>
-                                <p class="text-sm text-gray-400 mt-1">选择报告导出的默认格式</p>
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3>默认导出格式</h3>
+                                <p>选择报告导出的默认格式</p>
                             </div>
                             <select id="exportFormat" class="select-custom" onchange="updatePreference('exportFormat', this.value)">
                                 <option value="pdf">PDF 文档</option>
@@ -212,12 +345,12 @@ export const settingsPageHtml = `
                 </div>
                 
                 <!-- 外观主题 -->
-                <div id="tab-appearance" class="hidden space-y-4">
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between mb-4">
-                            <div>
-                                <h3 class="font-semibold">界面主题</h3>
-                                <p class="text-sm text-gray-400 mt-1">选择您喜欢的界面主题</p>
+                <div id="tab-appearance" class="hidden space-y-3 md:space-y-4">
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3>界面主题</h3>
+                                <p>选择您喜欢的界面主题</p>
                             </div>
                             <select id="theme" class="select-custom" onchange="updatePreference('theme', this.value)">
                                 <option value="dark">深色模式</option>
@@ -227,11 +360,11 @@ export const settingsPageHtml = `
                         </div>
                     </div>
                     
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between mb-4">
-                            <div>
-                                <h3 class="font-semibold">图表配色</h3>
-                                <p class="text-sm text-gray-400 mt-1">选择图表的主题配色</p>
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item mb-3">
+                            <div class="setting-item-info">
+                                <h3>图表配色</h3>
+                                <p>选择图表的主题配色</p>
                             </div>
                             <select id="chartColorScheme" class="select-custom" onchange="updatePreference('chartColorScheme', this.value)">
                                 <option value="gold">金色系</option>
@@ -240,19 +373,19 @@ export const settingsPageHtml = `
                                 <option value="purple">紫色系</option>
                             </select>
                         </div>
-                        <div class="flex gap-2 mt-3">
-                            <div class="w-8 h-8 rounded-full bg-gradient-to-r from-yellow-600 to-yellow-400 cursor-pointer" onclick="selectColorScheme('gold')"></div>
-                            <div class="w-8 h-8 rounded-full bg-gradient-to-r from-blue-600 to-blue-400 cursor-pointer" onclick="selectColorScheme('blue')"></div>
-                            <div class="w-8 h-8 rounded-full bg-gradient-to-r from-green-600 to-green-400 cursor-pointer" onclick="selectColorScheme('green')"></div>
-                            <div class="w-8 h-8 rounded-full bg-gradient-to-r from-purple-600 to-purple-400 cursor-pointer" onclick="selectColorScheme('purple')"></div>
+                        <div class="flex gap-2 mt-3 pl-0 md:pl-0">
+                            <div class="w-8 h-8 rounded-full bg-gradient-to-r from-yellow-600 to-yellow-400 cursor-pointer ring-2 ring-transparent hover:ring-yellow-500 transition" onclick="selectColorScheme('gold')"></div>
+                            <div class="w-8 h-8 rounded-full bg-gradient-to-r from-blue-600 to-blue-400 cursor-pointer ring-2 ring-transparent hover:ring-blue-500 transition" onclick="selectColorScheme('blue')"></div>
+                            <div class="w-8 h-8 rounded-full bg-gradient-to-r from-green-600 to-green-400 cursor-pointer ring-2 ring-transparent hover:ring-green-500 transition" onclick="selectColorScheme('green')"></div>
+                            <div class="w-8 h-8 rounded-full bg-gradient-to-r from-purple-600 to-purple-400 cursor-pointer ring-2 ring-transparent hover:ring-purple-500 transition" onclick="selectColorScheme('purple')"></div>
                         </div>
                     </div>
                     
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between mb-4">
-                            <div>
-                                <h3 class="font-semibold">语言</h3>
-                                <p class="text-sm text-gray-400 mt-1">选择界面显示语言</p>
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3>语言</h3>
+                                <p>选择界面显示语言</p>
                             </div>
                             <select id="language" class="select-custom" onchange="updatePreference('language', this.value)">
                                 <option value="zh-CN">简体中文</option>
@@ -264,12 +397,12 @@ export const settingsPageHtml = `
                 </div>
                 
                 <!-- 通知设置 -->
-                <div id="tab-notifications" class="hidden space-y-4">
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between">
-                            <div>
-                                <h3 class="font-semibold">邮件通知</h3>
-                                <p class="text-sm text-gray-400 mt-1">接收重要更新的邮件通知</p>
+                <div id="tab-notifications" class="hidden space-y-3 md:space-y-4">
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3>邮件通知</h3>
+                                <p>接收重要更新的邮件通知</p>
                             </div>
                             <label class="toggle-switch">
                                 <input type="checkbox" id="emailNotifications" onchange="updatePreference('emailNotifications', this.checked)">
@@ -278,11 +411,11 @@ export const settingsPageHtml = `
                         </div>
                     </div>
                     
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between">
-                            <div>
-                                <h3 class="font-semibold">报告完成通知</h3>
-                                <p class="text-sm text-gray-400 mt-1">分析报告生成完成时通知我</p>
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3>报告完成通知</h3>
+                                <p>分析报告生成完成时通知我</p>
                             </div>
                             <label class="toggle-switch">
                                 <input type="checkbox" id="reportCompleteNotify" onchange="updatePreference('reportCompleteNotify', this.checked)">
@@ -291,11 +424,11 @@ export const settingsPageHtml = `
                         </div>
                     </div>
                     
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between">
-                            <div>
-                                <h3 class="font-semibold">每周摘要</h3>
-                                <p class="text-sm text-gray-400 mt-1">每周发送投资分析摘要邮件</p>
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3>每周摘要</h3>
+                                <p>每周发送投资分析摘要邮件</p>
                             </div>
                             <label class="toggle-switch">
                                 <input type="checkbox" id="weeklyDigest" onchange="updatePreference('weeklyDigest', this.checked)">
@@ -304,11 +437,11 @@ export const settingsPageHtml = `
                         </div>
                     </div>
                     
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between">
-                            <div>
-                                <h3 class="font-semibold">营销邮件</h3>
-                                <p class="text-sm text-gray-400 mt-1">接收产品更新和促销信息</p>
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3>营销邮件</h3>
+                                <p>接收产品更新和促销信息</p>
                             </div>
                             <label class="toggle-switch">
                                 <input type="checkbox" id="marketingEmails" onchange="updatePreference('marketingEmails', this.checked)">
@@ -319,48 +452,59 @@ export const settingsPageHtml = `
                 </div>
                 
                 <!-- 账户管理 -->
-                <div id="tab-account" class="hidden space-y-4">
-                    <div class="setting-card rounded-xl p-5">
-                        <h3 class="font-semibold mb-4">常用股票</h3>
-                        <div id="favoriteStocksList" class="flex flex-wrap gap-2 mb-4">
+                <div id="tab-account" class="hidden space-y-3 md:space-y-4">
+                    <div class="setting-card p-4 md:p-5">
+                        <h3 class="font-semibold mb-3 md:mb-4 text-sm md:text-base">常用股票</h3>
+                        <div id="favoriteStocksList" class="flex flex-wrap gap-2 mb-3 md:mb-4">
                             <!-- 动态生成 -->
                         </div>
                         <div class="flex gap-2">
                             <input type="text" id="newFavoriteStock" placeholder="输入股票代码" 
-                                class="flex-1 px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:border-yellow-500 focus:outline-none">
-                            <button onclick="addFavoriteStock()" class="btn-outline px-4 py-2 rounded-lg text-sm">
+                                class="flex-1 min-w-0 px-3 md:px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:border-yellow-500 focus:outline-none">
+                            <button onclick="addFavoriteStock()" class="btn-outline px-3 md:px-4 py-2.5 rounded-lg text-sm flex-shrink-0">
                                 <i class="fas fa-plus mr-1"></i>添加
                             </button>
                         </div>
                     </div>
                     
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between mb-4">
-                            <div>
-                                <h3 class="font-semibold">搜索历史</h3>
-                                <p class="text-sm text-gray-400 mt-1">清除您的搜索历史记录</p>
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3>搜索历史</h3>
+                                <p>清除您的搜索历史记录</p>
                             </div>
-                            <button onclick="clearSearchHistory()" class="btn-outline px-4 py-2 rounded-lg text-sm">
-                                <i class="fas fa-trash mr-1"></i>清除历史
+                            <button onclick="clearSearchHistory()" class="btn-outline px-3 md:px-4 py-2 rounded-lg text-sm flex-shrink-0 whitespace-nowrap">
+                                <i class="fas fa-trash mr-1"></i>清除
                             </button>
                         </div>
                     </div>
                     
-                    <div class="setting-card rounded-xl p-5">
-                        <div class="flex items-center justify-between mb-4">
-                            <div>
-                                <h3 class="font-semibold">重置设置</h3>
-                                <p class="text-sm text-gray-400 mt-1">将所有设置恢复为默认值</p>
+                    <div class="setting-card p-4 md:p-5">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3>重置设置</h3>
+                                <p>将所有设置恢复为默认值</p>
                             </div>
-                            <button onclick="resetAllPreferences()" class="px-4 py-2 bg-red-500/20 border border-red-500/30 text-red-400 rounded-lg text-sm hover:bg-red-500/30 transition">
+                            <button onclick="resetAllPreferences()" class="px-3 md:px-4 py-2 bg-red-500/20 border border-red-500/30 text-red-400 rounded-lg text-sm hover:bg-red-500/30 transition flex-shrink-0 whitespace-nowrap">
                                 <i class="fas fa-undo mr-1"></i>重置
                             </button>
                         </div>
                     </div>
+
+                    <!-- 快捷入口：个人中心 -->
+                    <a href="/account" class="setting-card p-4 md:p-5 block cursor-pointer" style="text-decoration:none;border-color:rgba(212,175,55,0.15);">
+                        <div class="setting-item">
+                            <div class="setting-item-info">
+                                <h3 class="gold-text">个人中心</h3>
+                                <p>管理个人资料、会员信息和安全设置</p>
+                            </div>
+                            <i class="fas fa-chevron-right text-gray-500 flex-shrink-0"></i>
+                        </div>
+                    </a>
                 </div>
                 
                 <!-- 保存状态指示器 -->
-                <div id="saveIndicator" class="fixed bottom-8 right-8 px-4 py-2 bg-green-500/20 border border-green-500/30 text-green-400 rounded-lg opacity-0 transition-opacity duration-300">
+                <div id="saveIndicator" class="save-indicator">
                     <i class="fas fa-check mr-2"></i>已保存
                 </div>
             </div>
@@ -456,10 +600,10 @@ export const settingsPageHtml = `
             }
             
             list.innerHTML = stocks.map(code => \`
-                <span class="px-3 py-1 bg-gray-800 rounded-full text-sm flex items-center gap-2">
+                <span class="px-3 py-1.5 bg-gray-800 rounded-full text-sm flex items-center gap-2">
                     \${code}
-                    <button onclick="removeFavoriteStock('\${code}')" class="text-gray-500 hover:text-red-400">
-                        <i class="fas fa-times"></i>
+                    <button onclick="removeFavoriteStock('\${code}')" class="text-gray-500 hover:text-red-400 p-0.5">
+                        <i class="fas fa-times text-xs"></i>
                     </button>
                 </span>
             \`).join('');
@@ -504,12 +648,16 @@ export const settingsPageHtml = `
         }
         
         // 切换选项卡
-        function switchTab(tabName) {
+        function switchTab(tabName, el) {
             // 更新导航
             document.querySelectorAll('.nav-tab').forEach(tab => {
                 tab.classList.remove('active');
             });
-            event.target.closest('.nav-tab').classList.add('active');
+            if (el) {
+                el.classList.add('active');
+                // 滚动到可见区域 (移动端)
+                el.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+            }
             
             // 更新内容
             ['analysis', 'appearance', 'notifications', 'account'].forEach(name => {

@@ -1,0 +1,479 @@
+/**
+ * OpenEvals 风格评估服务
+ * 
+ * 基于 OpenEvals (langchain-ai/openevals) LLM-as-Judge 模式的 TypeScript 实现
+ * 核心功能:
+ * 1. LLM-as-Judge: 使用 Judge 模型评估 Agent 输出质量
+ * 2. 多维度评估: 6 个评估维度 + 加权综合分
+ * 3. Langfuse 集成: 评估分数自动记录到 Langfuse Trace
+ * 4. 异步非阻塞: 评估不影响主分析流程
+ * 5. 抽样控制: 支持 sampling 模式降低成本
+ * 
+ * 评估架构:
+ *   Layer 1: 基础指标 (JSON合规/字段完整率/延迟) — 已有 (orchestrator)
+ *   Layer 2: Agent 输出质量 (6维 LLM-as-Judge) — 本服务
+ *   Layer 3: 报告级评估 (跨Agent一致性) — 本服务
+ * 
+ * @see docs/openevals-evaluation-framework.md
+ */
+
+import type { TraceContext } from './langfuse';
+import { recordScore } from './langfuse';
+import {
+  FINANCIAL_HALLUCINATION_PROMPT,
+  FINANCIAL_ANALYSIS_DEPTH_PROMPT,
+  FINANCIAL_LOGICAL_CONSISTENCY_PROMPT,
+  FINANCIAL_EXPRESSION_QUALITY_PROMPT,
+  AGENT_EVAL_PROMPTS,
+  CROSS_AGENT_CONSISTENCY_PROMPT,
+  EVAL_DIMENSION_WEIGHTS,
+  type EvalDimension,
+} from './eval-prompts';
+
+// ============ 类型定义 ============
+
+export interface EvalConfig {
+  /** 是否启用评估 (默认 true) */
+  enabled?: boolean;
+  /** 评估模式: sampling=10%抽样, full=全量, off=关闭 */
+  mode?: 'sampling' | 'full' | 'off';
+  /** 抽样率 (0-1, 仅 sampling 模式, 默认 0.1) */
+  samplingRate?: number;
+  /** Judge 模型 (默认 gpt-4.1) */
+  judgeModel?: string;
+  /** 评估维度选择 (默认全部6维) */
+  dimensions?: EvalDimension[];
+  /** 是否执行 Layer3 跨Agent一致性检查 (默认 false, 仅 full 模式) */
+  enableCrossConsistency?: boolean;
+}
+
+export interface EvalScore {
+  /** 评估维度名 */
+  dimension: string;
+  /** 分数 (0-1) */
+  score: number;
+  /** 评审理由 */
+  reasoning: string;
+}
+
+export interface AgentEvalResult {
+  /** Agent 类型 */
+  agentType: string;
+  /** 各维度评分 */
+  scores: {
+    dataAccuracy?: EvalScore;
+    analysisDepth?: EvalScore;
+    professionalInsight?: EvalScore;
+    logicalConsistency?: EvalScore;
+    expressionQuality?: EvalScore;
+    hallucination?: EvalScore;
+  };
+  /** 加权综合分 (0-1) */
+  weightedTotal: number;
+  /** Judge 模型 */
+  judgeModel: string;
+  /** 评估耗时 (ms) */
+  evalLatencyMs: number;
+  /** 是否跳过 (抽样未命中) */
+  skipped: boolean;
+}
+
+export interface ReportEvalResult {
+  /** 跨 Agent 一致性评分 */
+  crossConsistency?: EvalScore;
+  /** 整体报告评分 */
+  overallScore: number;
+  /** 所有 Agent 评估结果 */
+  agentResults: AgentEvalResult[];
+}
+
+/** LLM 调用函数签名 (复用 VectorEngine) */
+export type LLMCallFn = (
+  systemPrompt: string,
+  userPrompt: string,
+  options?: { model?: string; temperature?: number }
+) => Promise<string>;
+
+// ============ 评估服务 ============
+
+export class OpenEvalsEvaluator {
+  private config: Required<EvalConfig>;
+  private llmCall: LLMCallFn;
+  private langfuseTrace: TraceContext | null;
+  private agentResults: AgentEvalResult[] = [];
+
+  constructor(
+    llmCall: LLMCallFn,
+    langfuseTrace: TraceContext | null,
+    config?: EvalConfig,
+  ) {
+    this.llmCall = llmCall;
+    this.langfuseTrace = langfuseTrace;
+    this.config = {
+      enabled: config?.enabled !== false,
+      mode: config?.mode || 'sampling',
+      samplingRate: config?.samplingRate ?? 0.1,
+      judgeModel: config?.judgeModel || 'gpt-4.1',
+      dimensions: config?.dimensions || [
+        'dataAccuracy', 'analysisDepth', 'professionalInsight',
+        'logicalConsistency', 'expressionQuality', 'hallucination',
+      ],
+      enableCrossConsistency: config?.enableCrossConsistency ?? false,
+    };
+  }
+
+  /**
+   * 判断当前 Agent 是否需要评估 (基于抽样率)
+   */
+  private shouldEvaluate(): boolean {
+    if (!this.config.enabled || this.config.mode === 'off') return false;
+    if (this.config.mode === 'full') return true;
+    // sampling 模式: 按概率抽样
+    return Math.random() < this.config.samplingRate;
+  }
+
+  /**
+   * 执行单个 LLM-as-Judge 评估
+   * 返回 0-1 的评分和评审理由
+   */
+  private async runJudge(
+    prompt: string,
+    inputs: string,
+    outputs: string,
+  ): Promise<EvalScore> {
+    const filledPrompt = prompt
+      .replace('{inputs}', inputs)
+      .replace('{outputs}', outputs);
+
+    try {
+      const response = await this.llmCall(
+        '你是专业的财务分析质量评审专家。请严格按照JSON格式返回评估结果。',
+        filledPrompt,
+        { model: this.config.judgeModel, temperature: 0.1 },
+      );
+
+      // 解析 Judge 响应
+      return this.parseJudgeResponse(response);
+    } catch (error) {
+      console.error('[OpenEvals] Judge 调用失败:', error);
+      return { dimension: 'unknown', score: -1, reasoning: `评估失败: ${error}` };
+    }
+  }
+
+  /**
+   * 解析 Judge 模型的 JSON 响应
+   */
+  private parseJudgeResponse(response: string): EvalScore {
+    try {
+      // 尝试直接解析
+      const parsed = JSON.parse(response);
+      return {
+        dimension: '',
+        score: Math.max(0, Math.min(1, Number(parsed.score) || 0)),
+        reasoning: String(parsed.reasoning || ''),
+      };
+    } catch {
+      // 尝试从 markdown 中提取 JSON
+      const jsonMatch = response.match(/\{[\s\S]*?"score"[\s\S]*?"reasoning"[\s\S]*?\}/);
+      if (jsonMatch) {
+        try {
+          const parsed = JSON.parse(jsonMatch[0]);
+          return {
+            dimension: '',
+            score: Math.max(0, Math.min(1, Number(parsed.score) || 0)),
+            reasoning: String(parsed.reasoning || ''),
+          };
+        } catch { /* fall through */ }
+      }
+
+      // 尝试从文本中提取分数
+      const scoreMatch = response.match(/(?:score|评分)[：:]\s*([\d.]+)/i);
+      const score = scoreMatch ? parseFloat(scoreMatch[1]) : 0.5;
+      return {
+        dimension: '',
+        score: Math.max(0, Math.min(1, score)),
+        reasoning: response.slice(0, 500),
+      };
+    }
+  }
+
+  /**
+   * 评估单个 Agent 输出 (Layer 2)
+   * 
+   * 执行 6 个维度的 LLM-as-Judge 评估:
+   * 1. Agent专用评估 → dataAccuracy + professionalInsight (合并)
+   * 2. 分析深度评估 → analysisDepth
+   * 3. 逻辑一致性评估 → logicalConsistency
+   * 4. 表达质量评估 → expressionQuality
+   * 5. 幻觉检测 → hallucination
+   * 
+   * @param agentType Agent 类型标识
+   * @param inputData 输入给 Agent 的数据 (用于评估准确性)
+   * @param agentOutput Agent 的 JSON 输出
+   */
+  async evaluateAgent(
+    agentType: string,
+    inputData: string,
+    agentOutput: string,
+  ): Promise<AgentEvalResult> {
+    const startTime = Date.now();
+
+    // 抽样检查
+    if (!this.shouldEvaluate()) {
+      const skippedResult: AgentEvalResult = {
+        agentType,
+        scores: {},
+        weightedTotal: -1,
+        judgeModel: this.config.judgeModel,
+        evalLatencyMs: 0,
+        skipped: true,
+      };
+      this.agentResults.push(skippedResult);
+      return skippedResult;
+    }
+
+    console.log(`[OpenEvals] 开始评估 Agent: ${agentType} (Judge: ${this.config.judgeModel})`);
+
+    // 截断输入输出以控制评估成本
+    const truncatedInput = inputData.slice(0, 8000);
+    const truncatedOutput = agentOutput.slice(0, 8000);
+
+    const scores: AgentEvalResult['scores'] = {};
+
+    // 并行执行多维度评估
+    const evalPromises: Promise<void>[] = [];
+
+    // 1. Agent 专用评估 → 映射为 dataAccuracy + professionalInsight
+    const agentPrompt = AGENT_EVAL_PROMPTS[agentType];
+    if (agentPrompt && this.config.dimensions.includes('dataAccuracy')) {
+      evalPromises.push(
+        this.runJudge(agentPrompt, truncatedInput, truncatedOutput).then(result => {
+          result.dimension = 'dataAccuracy';
+          scores.dataAccuracy = result;
+          // 同时复用为 professionalInsight (Agent 专用 prompt 综合评估了两个维度)
+          if (this.config.dimensions.includes('professionalInsight')) {
+            scores.professionalInsight = { ...result, dimension: 'professionalInsight' };
+          }
+        }),
+      );
+    }
+
+    // 2. 分析深度评估
+    if (this.config.dimensions.includes('analysisDepth')) {
+      evalPromises.push(
+        this.runJudge(FINANCIAL_ANALYSIS_DEPTH_PROMPT, truncatedInput, truncatedOutput).then(result => {
+          result.dimension = 'analysisDepth';
+          scores.analysisDepth = result;
+        }),
+      );
+    }
+
+    // 3. 逻辑一致性评估
+    if (this.config.dimensions.includes('logicalConsistency')) {
+      evalPromises.push(
+        this.runJudge(FINANCIAL_LOGICAL_CONSISTENCY_PROMPT, '', truncatedOutput).then(result => {
+          result.dimension = 'logicalConsistency';
+          scores.logicalConsistency = result;
+        }),
+      );
+    }
+
+    // 4. 表达质量评估
+    if (this.config.dimensions.includes('expressionQuality')) {
+      evalPromises.push(
+        this.runJudge(FINANCIAL_EXPRESSION_QUALITY_PROMPT, '', truncatedOutput).then(result => {
+          result.dimension = 'expressionQuality';
+          scores.expressionQuality = result;
+        }),
+      );
+    }
+
+    // 5. 幻觉检测
+    if (this.config.dimensions.includes('hallucination')) {
+      evalPromises.push(
+        this.runJudge(FINANCIAL_HALLUCINATION_PROMPT, truncatedInput, truncatedOutput).then(result => {
+          result.dimension = 'hallucination';
+          scores.hallucination = result;
+        }),
+      );
+    }
+
+    // 等待所有评估完成
+    await Promise.all(evalPromises);
+
+    // 计算加权综合分
+    const weightedTotal = this.calculateWeightedScore(scores);
+    const evalLatencyMs = Date.now() - startTime;
+
+    console.log(`[OpenEvals] Agent ${agentType} 评估完成: 综合分=${weightedTotal.toFixed(2)}, 耗时=${evalLatencyMs}ms`);
+
+    // 记录评分到 Langfuse
+    this.recordToLangfuse(agentType, scores, weightedTotal);
+
+    const result: AgentEvalResult = {
+      agentType,
+      scores,
+      weightedTotal,
+      judgeModel: this.config.judgeModel,
+      evalLatencyMs,
+      skipped: false,
+    };
+    this.agentResults.push(result);
+    return result;
+  }
+
+  /**
+   * 计算加权综合分
+   */
+  private calculateWeightedScore(scores: AgentEvalResult['scores']): number {
+    let totalWeight = 0;
+    let weightedSum = 0;
+
+    const dimensionMap: Record<string, EvalScore | undefined> = {
+      dataAccuracy: scores.dataAccuracy,
+      analysisDepth: scores.analysisDepth,
+      professionalInsight: scores.professionalInsight,
+      logicalConsistency: scores.logicalConsistency,
+      expressionQuality: scores.expressionQuality,
+      hallucination: scores.hallucination,
+    };
+
+    for (const [dim, evalScore] of Object.entries(dimensionMap)) {
+      if (evalScore && evalScore.score >= 0) {
+        const weight = EVAL_DIMENSION_WEIGHTS[dim as EvalDimension] || 0;
+        weightedSum += evalScore.score * weight;
+        totalWeight += weight;
+      }
+    }
+
+    return totalWeight > 0 ? weightedSum / totalWeight : 0;
+  }
+
+  /**
+   * 将评分记录到 Langfuse Trace
+   */
+  private recordToLangfuse(
+    agentType: string,
+    scores: AgentEvalResult['scores'],
+    weightedTotal: number,
+  ): void {
+    if (!this.langfuseTrace) return;
+
+    // 记录各维度分数
+    for (const [dim, evalScore] of Object.entries(scores)) {
+      if (evalScore && evalScore.score >= 0) {
+        recordScore(this.langfuseTrace, {
+          name: `eval-${agentType}-${dim}`,
+          value: evalScore.score,
+          comment: evalScore.reasoning?.slice(0, 500),
+        });
+      }
+    }
+
+    // 记录加权综合分
+    recordScore(this.langfuseTrace, {
+      name: `eval-${agentType}-weighted-total`,
+      value: weightedTotal,
+      comment: `Agent ${agentType} 加权综合评分 (${this.config.judgeModel})`,
+    });
+  }
+
+  /**
+   * Layer 3: 跨 Agent 一致性评估
+   * 在所有 Agent 执行完成后调用
+   * 
+   * @param allOutputs 所有 Agent 的输出 (JSON 字符串)
+   */
+  async evaluateCrossConsistency(allOutputs: string): Promise<EvalScore | null> {
+    if (!this.config.enableCrossConsistency) return null;
+    if (!this.config.enabled || this.config.mode === 'off') return null;
+
+    console.log('[OpenEvals] 开始跨 Agent 一致性评估 (Layer 3)');
+    const startTime = Date.now();
+
+    try {
+      const result = await this.runJudge(
+        CROSS_AGENT_CONSISTENCY_PROMPT,
+        '',
+        allOutputs.slice(0, 15000), // 截断以控制成本
+      );
+      result.dimension = 'crossConsistency';
+
+      const latency = Date.now() - startTime;
+      console.log(`[OpenEvals] 跨 Agent 一致性评分: ${result.score.toFixed(2)}, 耗时=${latency}ms`);
+
+      // 记录到 Langfuse
+      if (this.langfuseTrace) {
+        recordScore(this.langfuseTrace, {
+          name: 'eval-cross-consistency',
+          value: result.score,
+          comment: result.reasoning?.slice(0, 500),
+        });
+      }
+
+      return result;
+    } catch (error) {
+      console.error('[OpenEvals] 跨 Agent 一致性评估失败:', error);
+      return null;
+    }
+  }
+
+  /**
+   * 获取完整的报告评估结果
+   */
+  getReportEvalResult(): ReportEvalResult {
+    const evaluatedResults = this.agentResults.filter(r => !r.skipped && r.weightedTotal >= 0);
+    const avgScore = evaluatedResults.length > 0
+      ? evaluatedResults.reduce((sum, r) => sum + r.weightedTotal, 0) / evaluatedResults.length
+      : 0;
+
+    return {
+      overallScore: avgScore,
+      agentResults: this.agentResults,
+    };
+  }
+
+  /**
+   * 获取评估摘要 (适合日志输出)
+   */
+  getSummary(): string {
+    const result = this.getReportEvalResult();
+    const evaluated = result.agentResults.filter(r => !r.skipped);
+    const skipped = result.agentResults.filter(r => r.skipped);
+
+    const lines = [
+      `\n========== OpenEvals 评估摘要 ==========`,
+      `模式: ${this.config.mode} | Judge: ${this.config.judgeModel}`,
+      `评估: ${evaluated.length} 个 Agent | 跳过: ${skipped.length} 个`,
+      `整体评分: ${result.overallScore.toFixed(3)}`,
+    ];
+
+    for (const r of evaluated) {
+      const dims = Object.entries(r.scores)
+        .filter(([, v]) => v && v.score >= 0)
+        .map(([k, v]) => `${k}=${v!.score.toFixed(2)}`)
+        .join(', ');
+      lines.push(`  ${r.agentType}: 综合=${r.weightedTotal.toFixed(2)} [${dims}] (${r.evalLatencyMs}ms)`);
+    }
+
+    lines.push(`=========================================\n`);
+    return lines.join('\n');
+  }
+}
+
+// ============ 工厂函数 ============
+
+/**
+ * 创建 OpenEvals 评估器
+ * 
+ * @param llmCall LLM 调用函数 (通常从 VectorEngineService 适配)
+ * @param langfuseTrace Langfuse 追踪上下文 (可选)
+ * @param config 评估配置
+ */
+export function createOpenEvalsEvaluator(
+  llmCall: LLMCallFn,
+  langfuseTrace: TraceContext | null,
+  config?: EvalConfig,
+): OpenEvalsEvaluator {
+  return new OpenEvalsEvaluator(llmCall, langfuseTrace, config);
+}

@@ -6,12 +6,28 @@ export interface Message {
   content: string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
 }
 
+/**
+ * OpenAI-compatible response_format for structured output
+ * - { type: 'json_object' } → guarantees valid JSON syntax (no schema enforcement)
+ * - { type: 'json_schema', json_schema: { name, strict?, schema } } → 100% schema-compliant output
+ */
+export interface ResponseFormat {
+  type: 'json_object' | 'json_schema' | 'text';
+  json_schema?: {
+    name: string;
+    strict?: boolean;
+    schema: Record<string, unknown>;
+  };
+}
+
 export interface ChatOptions {
   model?: string;
   temperature?: number;
   maxTokens?: number;
   topP?: number;
   stream?: boolean;
+  /** Structured output format — uses OpenAI-compatible response_format */
+  responseFormat?: ResponseFormat;
 }
 
 export interface ChatResponse {
@@ -85,7 +101,10 @@ export type AgentType =
   | 'FORECAST'
   | 'VALUATION'
   | 'FINAL_CONCLUSION'
-  | 'INDUSTRY_COMPARISON';
+  | 'INDUSTRY_COMPARISON'
+  | 'SENTIMENT_ANALYSIS'
+  | 'COMPETITOR_TRACKING'
+  | 'POLICY_ANALYSIS';
 
 /**
  * Agent 模型配置 - 每个 Agent 可独立配置模型偏好
@@ -139,7 +158,7 @@ export function getAgentModel(
   agentType: AgentType, 
   config?: AgentModelConfig
 ): string {
-  const preference = config?.[agentType] || DEFAULT_AGENT_MODEL_CONFIG[agentType] || 'standard';
+  const preference = (config as any)?.[agentType] || (DEFAULT_AGENT_MODEL_CONFIG as any)[agentType] || 'standard';
   return getModelFromPreference(preference);
 }
 
@@ -168,6 +187,7 @@ export class VectorEngineService {
         max_tokens: options.maxTokens ?? 16384, // 增加到16384以确保深度分析输出完整
         top_p: options.topP ?? 1,
         stream: false,
+        ...(options.responseFormat ? { response_format: options.responseFormat } : {}),
       }),
     });
 
@@ -262,18 +282,26 @@ export class VectorEngineService {
 
   /**
    * 生成JSON格式的财报分析
-   * 使用特殊提示确保AI返回纯JSON格式
+   * 优先使用 response_format 结构化输出（100% 合规），回退到 prompt 约束
    * @param systemPrompt 系统提示词
    * @param userPrompt 用户提示词
-   * @param options 配置选项，包含 model 参数用于指定不同 Agent 使用不同模型
+   * @param options 配置选项，包含 model 和 responseFormat
    */
   async analyzeFinancialReportJson(
     systemPrompt: string,
     userPrompt: string,
     options: ChatOptions = {}
   ): Promise<string> {
-    // 在系统提示中强调 JSON 输出
-    const jsonSystemPrompt = `${systemPrompt}
+    // 如果调用方提供了 responseFormat (json_schema)，直接使用结构化输出
+    // 否则回退到 prompt 约束方式（兼容不支持 response_format 的模型）
+    const useStructuredOutput = !!options.responseFormat;
+    
+    let finalSystemPrompt = systemPrompt;
+    let finalUserPrompt = userPrompt;
+    
+    if (!useStructuredOutput) {
+      // 回退模式：在 prompt 中强调 JSON 输出
+      finalSystemPrompt = `${systemPrompt}
 
 【输出格式强制要求】
 你的回复必须且只能是一个有效的JSON对象：
@@ -282,20 +310,21 @@ export class VectorEngineService {
 3. 不要输出任何解释性文字、标题、分隔符
 4. 确保所有字符串值正确转义
 5. 不要在JSON前后添加任何内容`;
+      finalUserPrompt = userPrompt + '\n\n请直接输出JSON，不要任何其他内容：';
+    }
 
     const messages: Message[] = [
-      { role: 'system', content: jsonSystemPrompt },
-      { role: 'user', content: userPrompt + '\n\n请直接输出JSON，不要任何其他内容：' },
+      { role: 'system', content: finalSystemPrompt },
+      { role: 'user', content: finalUserPrompt },
     ];
 
-    // 优先使用传入的 model，否则使用默认分析模型
     const model = options.model || MODELS.ANALYSIS;
 
     const response = await this.chat(messages, {
-      temperature: 0.2, // 更低温度确保格式稳定
+      temperature: 0.2,
       maxTokens: 16384,
       ...options,
-      model, // 确保 model 参数生效
+      model,
     });
 
     return response.choices[0]?.message?.content || '';

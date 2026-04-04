@@ -13,11 +13,35 @@ import dataSync from './routes/dataSync';
 import membership from './routes/membership';
 import preferences from './routes/preferences';
 import agentPresets from './routes/agentPresets';
+import rag from './routes/rag';
+import ragEnhance from './routes/rag-enhance';
+import ragOps from './routes/rag-ops';
+import ragKnowledgeRoute from './routes/rag-knowledge';
 import { assistantPageHtml } from './pages/assistant';
 import { assistantWidgetHtml } from './pages/assistantWidget';
 import { membershipPageHtml } from './pages/membership';
 import { settingsPageHtml } from './pages/settings';
 import { agentSettingsPageHtml } from './pages/agentSettings';
+import { ragKnowledgeBaseHtml } from './pages/ragKnowledgeBase';
+import {
+  generateRagDashboard,
+  generateRagUpload,
+  generateRagKnowledgeBase,
+  generateRagChat,
+  generateRagChunkEnhance,
+  generateRagKnowledgeSettle,
+  generateRagRetrievalDebug,
+  generateRagTestSets,
+  generateRagEvaluation,
+  generateRagHealthCheck,
+  generateRagVersions,
+  generateRagLogChat,
+  generateRagLogIntent,
+  generateRagLogPipeline,
+  generateRagSettingsModels,
+  generateRagSettingsPrompts,
+  generateRagSettingsSystem,
+} from './pages/rag/index';
 import { floatingAssistantStyles, floatingAssistantHtml, floatingAssistantScript } from './components/floatingAssistant';
 import { analysisConfigStyles, analysisConfigHtml, analysisConfigScript } from './components/analysisConfig';
 import { stockMarketPanelStyles, stockMarketPanelHtml, stockMarketPanelScript } from './components/stockMarketPanel';
@@ -57,11 +81,39 @@ app.route('/api/data-sync', dataSync);
 app.route('/api/membership', membership);
 app.route('/api/preferences', preferences);
 app.route('/api/agent-presets', agentPresets);
+app.route('/api/rag', rag);
+app.route('/api/rag/enhance', ragEnhance);
+app.route('/api/rag/ops', ragOps);
+app.route('/api/rag/knowledge', ragKnowledgeRoute);
 
 // 智能问数助手页面 - 全屏模式
 app.get('/assistant', (c) => {
   return c.html(assistantPageHtml);
 });
+
+// RAG 知识库 — 旧版单页（保留向后兼容，重定向到新平台）
+app.get('/rag', (c) => {
+  return c.redirect('/rag/dashboard');
+});
+
+// ============ RAG 平台页面 (P.0 ~ P.16, 共 17 路由) ============
+app.get('/rag/dashboard',        (c) => c.html(generateRagDashboard()));
+app.get('/rag/upload',           (c) => c.html(generateRagUpload()));
+app.get('/rag/knowledge-base',   (c) => c.html(generateRagKnowledgeBase()));
+app.get('/rag/chunk-enhance',    (c) => c.html(generateRagChunkEnhance()));
+app.get('/rag/knowledge-settle', (c) => c.html(generateRagKnowledgeSettle()));
+app.get('/rag/chat',             (c) => c.html(generateRagChat()));
+app.get('/rag/retrieval-debug',  (c) => c.html(generateRagRetrievalDebug()));
+app.get('/rag/test-sets',        (c) => c.html(generateRagTestSets()));
+app.get('/rag/evaluation',       (c) => c.html(generateRagEvaluation()));
+app.get('/rag/health-check',     (c) => c.html(generateRagHealthCheck()));
+app.get('/rag/versions',         (c) => c.html(generateRagVersions()));
+app.get('/rag/logs/chat',        (c) => c.html(generateRagLogChat()));
+app.get('/rag/logs/intent',      (c) => c.html(generateRagLogIntent()));
+app.get('/rag/logs/pipeline',    (c) => c.html(generateRagLogPipeline()));
+app.get('/rag/settings/models',  (c) => c.html(generateRagSettingsModels()));
+app.get('/rag/settings/prompts', (c) => c.html(generateRagSettingsPrompts()));
+app.get('/rag/settings/system',  (c) => c.html(generateRagSettingsSystem()));
 
 // 智能问数助手 - 悬浮组件演示页面
 app.get('/assistant-widget', (c) => {
@@ -256,8 +308,8 @@ app.get('/analysis', (c) => {
                 </div>
             </div>
 
-            <!-- Agent执行状态 (A+D混合模式：5列紧凑，手机只显示图标) -->
-            <div class="grid grid-cols-5 gap-1.5 sm:gap-3 mb-6 md:mb-8" id="agentStatus">
+            <!-- Agent执行状态 (12个Agent：6列x2行，与后端orchestrator完全对齐) -->
+            <div class="grid grid-cols-6 gap-1.5 sm:gap-3 mb-6 md:mb-8" id="agentStatus">
                 <div class="agent-item card rounded-lg p-2 sm:p-3 text-center border-2 border-gray-700" title="分析规划">
                     <i class="fas fa-clipboard-list gold-text text-sm sm:text-base mb-0 sm:mb-2"></i>
                     <div class="hidden sm:block text-xs text-gray-400">分析规划</div>
@@ -273,6 +325,10 @@ app.get('/analysis', (c) => {
                 <div class="agent-item card rounded-lg p-2 sm:p-3 text-center border-2 border-gray-700" title="现金流">
                     <i class="fas fa-money-bill-wave gold-text text-sm sm:text-base mb-0 sm:mb-2"></i>
                     <div class="hidden sm:block text-xs text-gray-400">现金流</div>
+                </div>
+                <div class="agent-item card rounded-lg p-2 sm:p-3 text-center border-2 border-gray-700" title="趋势解读">
+                    <i class="fas fa-wave-square gold-text text-sm sm:text-base mb-0 sm:mb-2"></i>
+                    <div class="hidden sm:block text-xs text-gray-400">趋势解读</div>
                 </div>
                 <div class="agent-item card rounded-lg p-2 sm:p-3 text-center border-2 border-gray-700" title="三表联动">
                     <i class="fas fa-link gold-text text-sm sm:text-base mb-0 sm:mb-2"></i>
@@ -293,6 +349,10 @@ app.get('/analysis', (c) => {
                 <div class="agent-item card rounded-lg p-2 sm:p-3 text-center border-2 border-gray-700" title="业绩预测">
                     <i class="fas fa-chart-bar gold-text text-sm sm:text-base mb-0 sm:mb-2"></i>
                     <div class="hidden sm:block text-xs text-gray-400">业绩预测</div>
+                </div>
+                <div class="agent-item card rounded-lg p-2 sm:p-3 text-center border-2 border-gray-700" title="估值评估">
+                    <i class="fas fa-tags gold-text text-sm sm:text-base mb-0 sm:mb-2"></i>
+                    <div class="hidden sm:block text-xs text-gray-400">估值评估</div>
                 </div>
                 <div class="agent-item card rounded-lg p-2 sm:p-3 text-center border-2 border-gray-700" title="投资结论">
                     <i class="fas fa-gavel gold-text text-sm sm:text-base mb-0 sm:mb-2"></i>
@@ -1358,6 +1418,12 @@ app.get('/analysis', (c) => {
         const name = urlParams.get('name');
         const presetIdFromUrl = urlParams.get('presetId');
         const modelFromUrl = urlParams.get('model');
+        // 新增：用户偏好参数（来自首页分析配置面板）
+        const depthFromUrl = urlParams.get('depth');
+        const styleFromUrl = urlParams.get('style');
+        const forecastFromUrl = urlParams.get('forecast');
+        const industryCompareFromUrl = urlParams.get('industryCompare');
+        const comicFromUrl = urlParams.get('comic');
         
         if (!code) {
             window.location.href = '/';
@@ -1367,6 +1433,16 @@ app.get('/analysis', (c) => {
         let currentReportId = null;
         let currentReport = null;
         let analysisPresetOverrides = null;
+        
+        // 用户分析偏好（深度、风格、模块开关）
+        let userAnalysisPreferences = {
+            analysisDepth: depthFromUrl || 'standard',
+            analysisStyle: styleFromUrl || 'balanced',
+            includeForecast: forecastFromUrl !== '0',
+            includeIndustryCompare: industryCompareFromUrl !== '0',
+            includeComic: comicFromUrl !== '0',
+        };
+        console.log('[Analysis Prefs] User preferences:', userAnalysisPreferences);
         
         // 初始化分析配置覆盖（如果URL中有配置参数）
         if (presetIdFromUrl || modelFromUrl) {
@@ -1449,7 +1525,8 @@ app.get('/analysis', (c) => {
         document.getElementById('companyCode').textContent = code;
         
         // Agent名称映射
-        const agentNames = ['PLANNING', 'PROFITABILITY', 'BALANCE_SHEET', 'CASH_FLOW', 'EARNINGS_QUALITY', 'RISK', 'BUSINESS_INSIGHT', 'BUSINESS_MODEL', 'FORECAST', 'FINAL_CONCLUSION'];
+        // Agent名称映射 - 与后端orchestrator的12个Agent完全对齐
+        const agentNames = ['PLANNING', 'PROFITABILITY', 'BALANCE_SHEET', 'CASH_FLOW', 'TREND_INTERPRETATION', 'EARNINGS_QUALITY', 'RISK', 'BUSINESS_INSIGHT', 'BUSINESS_MODEL', 'FORECAST', 'VALUATION', 'FINAL_CONCLUSION'];
         
         // ============ 权限管理（分析页） ============
         let currentPermissions = null;
@@ -1596,14 +1673,17 @@ app.get('/analysis', (c) => {
             return false;
         }
         
-        // 页面加载时自动检查是否有已存在的报告
+        // 页面加载时自动检查是否有已存在的报告，若无则自动启动分析
         (async function initPage() {
             // 先初始化权限
             await initPermissions();
             
             const hasExisting = await checkExistingReport();
             if (!hasExisting) {
-                console.log('[Init] No existing report found, ready for new analysis');
+                console.log('[Init] No existing report found, starting analysis');
+                startAnalysis();
+            } else {
+                console.log('[Init] Existing report loaded, skipping startAnalysis');
             }
         })();
         
@@ -1622,7 +1702,16 @@ app.get('/analysis', (c) => {
                     reportType: 'annual',
                     options: {
                         includeBusinessModel: true,
-                        includeForecast: true,
+                        includeForecast: userAnalysisPreferences.includeForecast,
+                        includeComic: userAnalysisPreferences.includeComic,
+                    },
+                    // 新增：用户分析偏好（传递到后端影响分析结果）
+                    userPreferences: {
+                        analysisDepth: userAnalysisPreferences.analysisDepth,
+                        analysisStyle: userAnalysisPreferences.analysisStyle,
+                        includeForecast: userAnalysisPreferences.includeForecast,
+                        includeIndustryCompare: userAnalysisPreferences.includeIndustryCompare,
+                        includeComic: userAnalysisPreferences.includeComic,
                     }
                 };
                 
@@ -1631,6 +1720,7 @@ app.get('/analysis', (c) => {
                     requestBody.presetOverrides = analysisPresetOverrides;
                     console.log('[Analysis Config] Using preset overrides:', analysisPresetOverrides);
                 }
+                console.log('[Analysis Config] User preferences in request:', requestBody.userPreferences);
                 
                 const response = await fetch('/api/analyze/start', {
                     method: 'POST',
@@ -6095,6 +6185,7 @@ app.get('/analysis', (c) => {
         
         // ========== 业绩预测显示函数 ==========
         function displayForecast(report) {
+          try {
             const forecast = report.forecastResult || {};
             const summary = forecast.summary || {};
             const guidance = forecast.managementGuidance || {};
@@ -6103,51 +6194,85 @@ app.get('/analysis', (c) => {
             const scenario = detailed.scenarioAnalysis || {};
             const catalysts = forecast.catalysts || {};
             
+            console.log('[Forecast] Raw data keys:', Object.keys(forecast));
+            console.log('[Forecast] Summary:', JSON.stringify(summary).substring(0, 200));
+            
             // 置信度颜色
             const getConfidenceColor = (confidence) => {
-                if (!confidence) return 'bg-gray-600';
-                if (confidence === '高' || confidence.includes('高')) return 'bg-green-600';
-                if (confidence === '中' || confidence.includes('中')) return 'bg-yellow-500';
+                if (!confidence || typeof confidence !== 'string') return 'bg-gray-600';
+                if (confidence === '高' || confidence.includes('高') || confidence.toLowerCase() === 'high') return 'bg-green-600';
+                if (confidence === '中' || confidence.includes('中') || confidence.toLowerCase() === 'medium') return 'bg-yellow-500';
                 return 'bg-red-500';
             };
             
+            // 智能提取 - 兼容多种AI输出格式
+            const getField = (...paths) => {
+                for (const path of paths) {
+                    if (path !== undefined && path !== null && path !== '') return path;
+                }
+                return '';
+            };
+            
+            // 从多种可能的路径提取字段
+            const revenueOutlook = getField(summary.revenueOutlook, summary.revenue_outlook, forecast.revenueForecast?.expected ? '预计' + forecast.revenueForecast.expected : '');
+            const profitOutlook = getField(summary.profitOutlook, summary.profit_outlook, forecast.profitForecast?.expected ? '预计' + forecast.profitForecast.expected : '');
+            const growthRate = getField(summary.growthRate, summary.growth_rate, summary.expectedGrowth);
+            const forecastBasis = getField(summary.forecastBasis, summary.forecast_basis, summary.basis);
+            const oneSentence = getField(summary.oneSentence, summary.one_sentence, summary.conclusion, summary.overview);
+            const confidence = getField(summary.confidence, forecast.confidence, '');
+            const keyRisks = getField(summary.keyRisks, summary.key_risks);
+            
             // 预测置信度徽章
-            const confidence = summary.confidence || forecast.confidence || '数据加载中';
             const confidenceBadge = document.getElementById('forecastConfidenceBadge');
             if (confidenceBadge) {
-                confidenceBadge.className = \`px-4 py-1 rounded-full text-sm font-semibold \${getConfidenceColor(confidence)} text-white\`;
-                confidenceBadge.innerHTML = \`<i class="fas fa-bullseye mr-1"></i>置信度: \${confidence}\`;
+                const confLabel = confidence || '待评估';
+                confidenceBadge.className = \`px-4 py-1 rounded-full text-sm font-semibold \${getConfidenceColor(confLabel)} text-white\`;
+                confidenceBadge.innerHTML = \`<i class="fas fa-bullseye mr-1"></i>置信度: \${confLabel}\`;
             }
             
             const forecastContent = document.getElementById('forecastContent');
+            if (!forecastContent) return;
+            
             let forecastHtml = '';
             
-            if (summary.oneSentence || summary.revenueOutlook || summary.growthRate) {
+            // 判断是否有有效数据 - 更宽松的检测
+            const hasStructuredData = oneSentence || revenueOutlook || growthRate || profitOutlook;
+            // 兼容旧格式 ForecastResult type: assumptions, revenueForecast, profitForecast
+            const hasLegacyData = forecast.assumptions || forecast.revenueForecast || forecast.profitForecast;
+            // 检测是否有任何非元数据字段（排除 agentName, status, executionTime, timestamp）
+            const metaKeys = ['agentName', 'status', 'executionTime', 'timestamp'];
+            const dataKeys = Object.keys(forecast).filter(k => !metaKeys.includes(k));
+            const hasAnyData = dataKeys.length > 0;
+            
+            console.log('[Forecast] hasStructuredData:', hasStructuredData, 'hasLegacyData:', hasLegacyData, 'hasAnyData:', hasAnyData, 'dataKeys:', dataKeys);
+            
+            if (hasStructuredData) {
+                // ====== 标准格式渲染 ======
                 forecastHtml = \`
                     <!-- 预测核心指标 -->
                     <div class="grid md:grid-cols-4 gap-3 mb-4">
                         <div class="bg-gray-800/40 p-3 rounded-lg border border-gray-700">
                             <div class="text-xs text-gray-500 mb-1">营收展望</div>
-                            <div class="text-lg font-semibold text-emerald-400">\${summary.revenueOutlook || '--'}</div>
+                            <div class="text-lg font-semibold text-emerald-400">\${revenueOutlook || '--'}</div>
                         </div>
                         <div class="bg-gray-800/40 p-3 rounded-lg border border-gray-700">
                             <div class="text-xs text-gray-500 mb-1">利润展望</div>
-                            <div class="text-lg font-semibold text-green-400">\${summary.profitOutlook || '--'}</div>
+                            <div class="text-lg font-semibold text-green-400">\${profitOutlook || '--'}</div>
                         </div>
                         <div class="bg-gray-800/40 p-3 rounded-lg border border-gray-700">
                             <div class="text-xs text-gray-500 mb-1">预期增速</div>
-                            <div class="text-lg font-semibold text-yellow-400">\${summary.growthRate || '--'}</div>
+                            <div class="text-lg font-semibold text-yellow-400">\${growthRate || '--'}</div>
                         </div>
                         <div class="bg-gray-800/40 p-3 rounded-lg border border-gray-700">
                             <div class="text-xs text-gray-500 mb-1">预测基础</div>
-                            <div class="text-xs font-semibold text-blue-400">\${summary.forecastBasis || '--'}</div>
+                            <div class="text-xs font-semibold text-blue-400">\${forecastBasis || '--'}</div>
                         </div>
                     </div>
                     
                     <!-- 核心预测结论 -->
-                    \${summary.oneSentence ? \`
+                    \${oneSentence ? \`
                     <div class="p-3 bg-gray-800/30 rounded-lg border-l-2 border-emerald-500 mb-4">
-                        <p class="text-gray-300">\${summary.oneSentence}</p>
+                        <p class="text-gray-300">\${oneSentence}</p>
                     </div>
                     \` : ''}
                     
@@ -6220,7 +6345,7 @@ app.get('/analysis', (c) => {
                                 </h5>
                                 \${shortTerm.revenueGrowth ? \`<p class="text-gray-300 text-sm mb-2"><strong>营收增长:</strong> \${shortTerm.revenueGrowth}</p>\` : ''}
                                 \${shortTerm.profitGrowth ? \`<p class="text-gray-300 text-sm mb-2"><strong>利润增长:</strong> \${shortTerm.profitGrowth}</p>\` : ''}
-                                \${shortTerm.keyAssumptions && shortTerm.keyAssumptions.length > 0 ? \`
+                                \${shortTerm.keyAssumptions && Array.isArray(shortTerm.keyAssumptions) && shortTerm.keyAssumptions.length > 0 ? \`
                                 <div class="mt-3">
                                     <p class="text-xs text-gray-500 mb-1">关键假设:</p>
                                     <ul class="text-xs text-gray-400 space-y-1">
@@ -6232,9 +6357,9 @@ app.get('/analysis', (c) => {
                             \` : ''}
                             
                             <!-- 催化剂 -->
-                            \${(catalysts.positive && catalysts.positive.length > 0) || (catalysts.negative && catalysts.negative.length > 0) ? \`
+                            \${(catalysts.positive && Array.isArray(catalysts.positive) && catalysts.positive.length > 0) || (catalysts.negative && Array.isArray(catalysts.negative) && catalysts.negative.length > 0) ? \`
                             <div class="grid md:grid-cols-2 gap-4">
-                                \${catalysts.positive && catalysts.positive.length > 0 ? \`
+                                \${catalysts.positive && Array.isArray(catalysts.positive) && catalysts.positive.length > 0 ? \`
                                 <div class="bg-green-900/20 p-4 rounded-lg border border-green-800/30">
                                     <h5 class="font-semibold text-green-400 mb-2 flex items-center">
                                         <i class="fas fa-arrow-up mr-2"></i>正向催化剂
@@ -6244,7 +6369,7 @@ app.get('/analysis', (c) => {
                                     </ul>
                                 </div>
                                 \` : ''}
-                                \${catalysts.negative && catalysts.negative.length > 0 ? \`
+                                \${catalysts.negative && Array.isArray(catalysts.negative) && catalysts.negative.length > 0 ? \`
                                 <div class="bg-red-900/20 p-4 rounded-lg border border-red-800/30">
                                     <h5 class="font-semibold text-red-400 mb-2 flex items-center">
                                         <i class="fas fa-arrow-down mr-2"></i>负向催化剂
@@ -6258,7 +6383,7 @@ app.get('/analysis', (c) => {
                             \` : ''}
                             
                             <!-- 预测风险 -->
-                            \${forecast.forecastRisks && forecast.forecastRisks.length > 0 ? \`
+                            \${forecast.forecastRisks && Array.isArray(forecast.forecastRisks) && forecast.forecastRisks.length > 0 ? \`
                             <div class="bg-yellow-900/20 p-4 rounded-lg border border-yellow-800/30">
                                 <h5 class="font-semibold text-yellow-400 mb-2 flex items-center">
                                     <i class="fas fa-exclamation-triangle mr-2"></i>预测风险
@@ -6268,23 +6393,110 @@ app.get('/analysis', (c) => {
                                 </ul>
                             </div>
                             \` : ''}
+                            
+                            <!-- 兼容旧格式风险列表: risks/caveats -->
+                            \${forecast.risks && Array.isArray(forecast.risks) && forecast.risks.length > 0 ? \`
+                            <div class="bg-yellow-900/20 p-4 rounded-lg border border-yellow-800/30">
+                                <h5 class="font-semibold text-yellow-400 mb-2 flex items-center">
+                                    <i class="fas fa-exclamation-triangle mr-2"></i>预测风险
+                                </h5>
+                                <ul class="space-y-2">
+                                    \${forecast.risks.map(r => \`<li class="text-gray-300 text-sm flex items-start"><i class="fas fa-circle text-yellow-500 mr-2 mt-1.5 text-xs"></i>\${r}</li>\`).join('')}
+                                </ul>
+                            </div>
+                            \` : ''}
                         </div>
                     </details>
                 \`;
+            } else if (hasLegacyData) {
+                // ====== 旧格式兼容渲染 (TypeScript ForecastResult type) ======
+                const assumptions = forecast.assumptions || [];
+                const revForecast = forecast.revenueForecast || {};
+                const profForecast = forecast.profitForecast || {};
+                const risks = forecast.risks || [];
+                const caveats = forecast.caveats || [];
+                
+                forecastHtml = \`
+                    <div class="grid md:grid-cols-3 gap-3 mb-4">
+                        <div class="bg-gray-800/40 p-3 rounded-lg border border-gray-700">
+                            <div class="text-xs text-gray-500 mb-1">营收预测</div>
+                            <div class="text-lg font-semibold text-emerald-400">\${revForecast.expected ? revForecast.expected.toLocaleString() : '--'}</div>
+                            \${revForecast.min && revForecast.max ? \`<div class="text-xs text-gray-500">区间: \${revForecast.min.toLocaleString()} ~ \${revForecast.max.toLocaleString()}</div>\` : ''}
+                        </div>
+                        <div class="bg-gray-800/40 p-3 rounded-lg border border-gray-700">
+                            <div class="text-xs text-gray-500 mb-1">利润预测</div>
+                            <div class="text-lg font-semibold text-green-400">\${profForecast.expected ? profForecast.expected.toLocaleString() : '--'}</div>
+                            \${profForecast.min && profForecast.max ? \`<div class="text-xs text-gray-500">区间: \${profForecast.min.toLocaleString()} ~ \${profForecast.max.toLocaleString()}</div>\` : ''}
+                        </div>
+                        <div class="bg-gray-800/40 p-3 rounded-lg border border-gray-700">
+                            <div class="text-xs text-gray-500 mb-1">置信度</div>
+                            <div class="text-lg font-semibold text-yellow-400">\${forecast.confidence || '--'}</div>
+                        </div>
+                    </div>
+                    \${assumptions.length > 0 ? \`
+                    <div class="mb-4">
+                        <h4 class="text-sm font-semibold text-emerald-400 mb-2"><i class="fas fa-list-check mr-1"></i>关键假设</h4>
+                        <ul class="space-y-1">\${assumptions.map(a => \`<li class="text-gray-300 text-sm flex items-start"><i class="fas fa-check text-emerald-500 mr-2 mt-1"></i>\${a}</li>\`).join('')}</ul>
+                    </div>
+                    \` : ''}
+                    \${risks.length > 0 ? \`
+                    <div class="mb-4">
+                        <h4 class="text-sm font-semibold text-yellow-400 mb-2"><i class="fas fa-exclamation-triangle mr-1"></i>风险因素</h4>
+                        <ul class="space-y-1">\${risks.map(r => \`<li class="text-gray-300 text-sm flex items-start"><i class="fas fa-circle text-yellow-500 mr-2 mt-1.5 text-xs"></i>\${r}</li>\`).join('')}</ul>
+                    </div>
+                    \` : ''}
+                    \${caveats.length > 0 ? \`
+                    <div>
+                        <h4 class="text-sm font-semibold text-gray-400 mb-2"><i class="fas fa-info-circle mr-1"></i>注意事项</h4>
+                        <ul class="space-y-1">\${caveats.map(c => \`<li class="text-gray-400 text-sm flex items-start"><i class="fas fa-minus text-gray-500 mr-2 mt-1"></i>\${c}</li>\`).join('')}</ul>
+                    </div>
+                    \` : ''}
+                \`;
+            } else if (hasAnyData) {
+                // ====== 通用回退渲染 - 从任意结构中提取有意义的内容 ======
+                console.log('[Forecast] Using fallback renderer for keys:', dataKeys);
+                forecastHtml = \`<div class="space-y-3">\`;
+                for (const key of dataKeys) {
+                    const val = forecast[key];
+                    if (val === null || val === undefined) continue;
+                    const label = key.replace(/([A-Z])/g, ' $1').replace(/^./, s => s.toUpperCase());
+                    if (typeof val === 'string') {
+                        forecastHtml += \`<div class="bg-gray-800/30 p-3 rounded-lg"><span class="text-emerald-400 text-sm font-semibold">\${label}:</span> <span class="text-gray-300 text-sm ml-2">\${val}</span></div>\`;
+                    } else if (Array.isArray(val)) {
+                        forecastHtml += \`<div class="bg-gray-800/30 p-3 rounded-lg"><span class="text-emerald-400 text-sm font-semibold">\${label}:</span><ul class="mt-1 space-y-1">\${val.map(v => \`<li class="text-gray-300 text-sm ml-4">• \${typeof v === 'string' ? v : JSON.stringify(v)}</li>\`).join('')}</ul></div>\`;
+                    } else if (typeof val === 'object') {
+                        const entries = Object.entries(val).filter(([, v2]) => v2 !== null && v2 !== undefined);
+                        if (entries.length > 0) {
+                            forecastHtml += \`<div class="bg-gray-800/30 p-3 rounded-lg"><span class="text-emerald-400 text-sm font-semibold">\${label}:</span><div class="mt-1 space-y-1">\${entries.map(([k2, v2]) => \`<div class="text-gray-300 text-sm ml-4"><span class="text-gray-500">\${k2}:</span> \${typeof v2 === 'string' ? v2 : JSON.stringify(v2)}</div>\`).join('')}</div></div>\`;
+                        }
+                    }
+                }
+                forecastHtml += \`</div>\`;
             } else {
                 forecastHtml = \`
-                    <div class="grid md:grid-cols-3 gap-3">
-                        <div class="bg-gray-800/30 p-3 rounded-lg"><span class="text-gray-500">营收展望:</span> <span class="text-gray-400">--</span></div>
-                        <div class="bg-gray-800/30 p-3 rounded-lg"><span class="text-gray-500">利润展望:</span> <span class="text-gray-400">--</span></div>
-                        <div class="bg-gray-800/30 p-3 rounded-lg"><span class="text-gray-500">预期增速:</span> <span class="text-gray-400">--</span></div>
+                    <div class="text-center py-6 text-gray-500">
+                        <i class="fas fa-chart-line text-3xl mb-3 text-gray-600"></i>
+                        <div class="text-sm">暂无业绩预测数据</div>
+                        <div class="text-xs text-gray-600 mt-1">该股票尚未生成业绩预测分析</div>
                     </div>
-                    <p class="text-gray-500 text-sm mt-4">业绩预测数据加载中...</p>
                 \`;
             }
             
+            forecastContent.innerHTML = forecastHtml;
+            console.log('[Forecast] Rendered successfully, hasStructuredData:', hasStructuredData);
+          } catch (error) {
+            console.error('[Forecast] displayForecast error:', error);
+            const forecastContent = document.getElementById('forecastContent');
             if (forecastContent) {
-                forecastContent.innerHTML = forecastHtml;
+                forecastContent.innerHTML = \`
+                    <div class="text-center py-6 text-red-400">
+                        <i class="fas fa-exclamation-circle text-2xl mb-2"></i>
+                        <div class="text-sm">业绩预测数据渲染异常</div>
+                        <div class="text-xs text-gray-500 mt-1">请尝试刷新页面或重新分析</div>
+                    </div>
+                \`;
             }
+          }
         }
         
         // 导出 PDF
@@ -7599,8 +7811,8 @@ app.get('/analysis', (c) => {
             window.StockMarketPanel.loadData(code, 90); // 默认加载3个月数据
         }
         
-        // 启动分析（面板初始化后才执行，确保可以安全调用loadData）
-        startAnalysis();
+        // 启动分析已移至initPage()内部，仅在无已有报告时执行
+        // startAnalysis() is now called inside initPage() only when needed
   `;
 
   // 使用 mainLayout 组装完整页面
@@ -7664,7 +7876,7 @@ app.get('/my-reports', (c) => {
                 <a href="/" class="text-gray-400 hover:text-white">首页</a>
                 <a href="/my-reports" class="gold-text font-medium">我的分析</a>
                 <a href="/favorites" class="text-gray-400 hover:text-white">我的收藏</a>
-                <a href="/account" class="text-gray-400 hover:text-white">账号设置</a>
+                <a href="/account" class="text-gray-400 hover:text-white">个人中心</a>
             </div>
         </div>
     </nav>
@@ -7679,6 +7891,9 @@ app.get('/my-reports', (c) => {
             <div class="flex items-center space-x-2">
                 <a href="/" class="p-2 text-gray-400 hover:text-white touch-target">
                     <i class="fas fa-home text-lg"></i>
+                </a>
+                <a href="/account" class="p-2 text-gray-400 hover:text-white touch-target">
+                    <i class="fas fa-user-circle text-lg"></i>
                 </a>
                 <a href="/favorites" class="p-2 text-gray-400 hover:text-white touch-target">
                     <i class="fas fa-heart text-lg"></i>
@@ -8334,7 +8549,7 @@ app.get('/favorites', (c) => {
                 <a href="/" class="text-gray-400 hover:text-white">首页</a>
                 <a href="/my-reports" class="text-gray-400 hover:text-white">我的分析</a>
                 <a href="/favorites" class="gold-text font-medium">我的收藏</a>
-                <a href="/account" class="text-gray-400 hover:text-white">账号设置</a>
+                <a href="/account" class="text-gray-400 hover:text-white">个人中心</a>
             </div>
         </div>
     </nav>
@@ -8349,6 +8564,9 @@ app.get('/favorites', (c) => {
             <div class="flex items-center space-x-2">
                 <a href="/" class="p-2 text-gray-400 hover:text-white touch-target">
                     <i class="fas fa-home text-lg"></i>
+                </a>
+                <a href="/account" class="p-2 text-gray-400 hover:text-white touch-target">
+                    <i class="fas fa-user-circle text-lg"></i>
                 </a>
                 <a href="/my-reports" class="p-2 text-gray-400 hover:text-white touch-target">
                     <i class="fas fa-chart-pie text-lg"></i>
@@ -8922,7 +9140,7 @@ app.get('/favorites', (c) => {
   `);
 });
 
-// ============ 账号设置页面 ============
+// ============ 个人中心页面 ============
 app.get('/account', (c) => {
   return c.html(`
 <!DOCTYPE html>
@@ -8930,140 +9148,250 @@ app.get('/account', (c) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>账号设置 - Finspark 投资分析</title>
+    <title>个人中心 - Finspark 投资分析</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Noto Sans SC', sans-serif; background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 100%); min-height: 100vh; }
         .gold-text { color: #d4af37; }
         .gold-gradient { background: linear-gradient(135deg, #d4af37 0%, #f5d17e 50%, #d4af37 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
-        .card { background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(212, 175, 55, 0.2); }
+        .card { background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(212, 175, 55, 0.2); border-radius: 12px; }
         .btn-gold { background: linear-gradient(135deg, #d4af37 0%, #f5d17e 100%); color: #0a0a0a; font-weight: 600; transition: all 0.3s; }
         .btn-gold:hover { transform: scale(1.02); }
         .btn-outline { border: 1px solid rgba(212, 175, 55, 0.5); color: #d4af37; transition: all 0.3s; }
         .btn-outline:hover { background: rgba(212, 175, 55, 0.1); }
-        .input-field { background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); color: white; }
-        .input-field:focus { border-color: #d4af37; outline: none; }
-        .tier-card { background: rgba(212, 175, 55, 0.05); border: 1px solid rgba(212, 175, 55, 0.2); }
-        .tier-card.active { background: rgba(212, 175, 55, 0.15); border-color: #d4af37; }
-        .tier-badge { padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+        .input-field { background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); color: white; font-size: 15px; }
+        .input-field:focus { border-color: #d4af37; outline: none; box-shadow: 0 0 0 2px rgba(212, 175, 55, 0.15); }
+        .tier-badge { padding: 3px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; color: white; }
         .tier-free { background: #3b82f6; }
         .tier-pro { background: #8b5cf6; }
-        .tier-elite { background: #d4af37; color: #0a0a0a; }
+        .tier-elite { background: linear-gradient(135deg, #d4af37, #f5d17e); color: #0a0a0a; }
+
+        /* Quick action cards */
+        .quick-action {
+            display: flex; align-items: center; gap: 12px;
+            padding: 14px 16px; border-radius: 10px;
+            background: rgba(255,255,255,0.02);
+            border: 1px solid rgba(255,255,255,0.06);
+            text-decoration: none; color: #e5e7eb;
+            transition: all 0.2s;
+        }
+        .quick-action:hover { border-color: rgba(212,175,55,0.3); background: rgba(212,175,55,0.05); }
+        .quick-action-icon {
+            width: 40px; height: 40px; border-radius: 10px;
+            display: flex; align-items: center; justify-content: center;
+            flex-shrink: 0; font-size: 16px;
+        }
+        .quick-action-text h4 { font-size: 14px; font-weight: 500; margin-bottom: 2px; }
+        .quick-action-text p { font-size: 12px; color: #6b7280; }
+
+        /* Mobile responsive */
+        @media (max-width: 639px) {
+            .stat-number { font-size: 1.25rem !important; }
+            .card { padding: 16px !important; }
+            .profile-header { flex-direction: column; text-align: center; }
+            .profile-header .avatar-section { margin-bottom: 12px; }
+        }
+
+        /* Touch device */
+        @media (hover: none) and (pointer: coarse) {
+            .btn-outline, .quick-action { min-height: 44px; }
+            .input-field { padding: 14px 16px !important; font-size: 16px !important; /* prevent iOS zoom */ }
+        }
+
+        ${responsiveStyles}
     </style>
 </head>
 <body class="text-white">
-    <nav class="fixed top-0 left-0 right-0 z-50 bg-black/80 backdrop-blur-md border-b border-gray-800">
-        <div class="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
-            <a href="/" class="flex items-center space-x-3">
-                <i class="fas fa-chart-line text-2xl gold-text"></i>
-                <span class="text-xl font-bold gold-gradient">Finspark 投资分析</span>
+    <!-- 桌面端导航栏 -->
+    <nav class="fixed top-0 left-0 right-0 z-50 bg-black/80 backdrop-blur-md border-b border-gray-800 hide-on-mobile">
+        <div class="container-adaptive py-4 flex items-center justify-between">
+            <a href="/" class="flex items-center space-x-2" style="text-decoration:none;">
+                <i class="fas fa-chart-line text-xl gold-text"></i>
+                <span class="text-xl font-bold gold-gradient">Finspark</span>
             </a>
             <div class="flex items-center space-x-6">
                 <a href="/" class="text-gray-400 hover:text-white">首页</a>
                 <a href="/my-reports" class="text-gray-400 hover:text-white">我的分析</a>
                 <a href="/favorites" class="text-gray-400 hover:text-white">我的收藏</a>
-                <a href="/account" class="gold-text font-medium">账号设置</a>
+                <a href="/account" class="gold-text font-medium">个人中心</a>
+            </div>
+        </div>
+    </nav>
+    
+    <!-- 移动端导航栏 -->
+    <nav class="mobile-nav show-on-mobile bg-black/80 backdrop-blur-md border-b border-gray-800">
+        <div class="px-4 py-3 flex items-center justify-between">
+            <a href="/" class="flex items-center space-x-2" style="text-decoration:none;">
+                <i class="fas fa-chart-line text-xl gold-text"></i>
+                <span class="text-lg font-bold gold-gradient">Finspark</span>
+            </a>
+            <div class="flex items-center space-x-1">
+                <a href="/settings" class="p-2 text-gray-400 hover:text-white touch-target" title="设置">
+                    <i class="fas fa-cog text-lg"></i>
+                </a>
+                <a href="/" class="p-2 text-gray-400 hover:text-white touch-target" title="首页">
+                    <i class="fas fa-home text-lg"></i>
+                </a>
             </div>
         </div>
     </nav>
 
-    <main class="pt-24 pb-16 px-4">
-        <div class="max-w-3xl mx-auto">
-            <h1 class="text-3xl font-bold gold-gradient mb-8"><i class="fas fa-cog mr-3"></i>账号设置</h1>
+    <main class="pt-adaptive-header pb-8 md:pb-16">
+        <div class="container-adaptive" style="max-width: 720px;">
+            <!-- 页面标题 -->
+            <h1 class="text-2xl md:text-3xl font-bold gold-gradient mb-4 md:mb-6">
+                <i class="fas fa-user-circle mr-2"></i>个人中心
+            </h1>
             
             <!-- 需要登录提示 -->
-            <div id="needLogin" class="card rounded-xl p-8 text-center hidden">
-                <i class="fas fa-lock text-5xl gold-text mb-4"></i>
-                <h3 class="text-xl font-semibold mb-2">请先登录</h3>
-                <p class="text-gray-400 mb-6">登录后即可管理您的账号设置</p>
-                <a href="/login" class="btn-gold px-8 py-3 rounded-lg inline-block">前往登录</a>
+            <div id="needLogin" class="card p-6 md:p-8 text-center hidden">
+                <i class="fas fa-lock text-4xl md:text-5xl gold-text mb-4"></i>
+                <h3 class="text-lg md:text-xl font-semibold mb-2">请先登录</h3>
+                <p class="text-gray-400 mb-6 text-sm md:text-base">登录后即可管理您的个人信息和账号设置</p>
+                <a href="/login" class="btn-gold px-6 md:px-8 py-3 rounded-lg inline-block" style="text-decoration:none;">前往登录</a>
             </div>
             
             <!-- 账号信息 -->
-            <div id="accountContent" class="space-y-6">
-                <!-- 会员信息 -->
-                <div class="card rounded-xl p-6">
-                    <h2 class="text-lg font-semibold gold-text mb-4"><i class="fas fa-crown mr-2"></i>会员信息</h2>
-                    <div class="flex items-center justify-between">
+            <div id="accountContent" class="space-y-4 md:space-y-6">
+                <!-- 会员信息卡片 -->
+                <div class="card p-4 md:p-6">
+                    <h2 class="text-base md:text-lg font-semibold gold-text mb-3 md:mb-4">
+                        <i class="fas fa-crown mr-2"></i>会员信息
+                    </h2>
+                    <div class="flex items-center justify-between mb-3 md:mb-4">
                         <div>
                             <div class="flex items-center gap-2 mb-1">
-                                <span class="text-gray-300">当前等级：</span>
+                                <span class="text-gray-300 text-sm">当前等级：</span>
                                 <span id="tierBadge" class="tier-badge tier-free">免费</span>
                             </div>
-                            <div class="text-sm text-gray-500" id="tierExpires"></div>
+                            <div class="text-xs md:text-sm text-gray-500" id="tierExpires"></div>
                         </div>
                         <div class="text-right">
-                            <div class="text-sm text-gray-400">今日剩余分析</div>
-                            <div class="text-2xl font-bold gold-text" id="remainingQuota">--</div>
+                            <div class="text-xs md:text-sm text-gray-400">今日剩余分析</div>
+                            <div class="text-xl md:text-2xl font-bold gold-text" id="remainingQuota">--</div>
                         </div>
                     </div>
-                    <div class="mt-4 pt-4 border-t border-gray-700">
-                        <div class="grid grid-cols-3 gap-4 text-center">
+                    <div class="pt-3 md:pt-4 border-t border-gray-700/50">
+                        <div class="grid grid-cols-3 gap-3 md:gap-4 text-center">
                             <div>
-                                <div class="text-2xl font-bold gold-text" id="totalAnalyses">0</div>
+                                <div class="stat-number text-xl md:text-2xl font-bold gold-text" id="totalAnalyses">0</div>
                                 <div class="text-xs text-gray-500">总分析数</div>
                             </div>
                             <div>
-                                <div class="text-2xl font-bold text-purple-400" id="totalComics">0</div>
+                                <div class="stat-number text-xl md:text-2xl font-bold text-purple-400" id="totalComics">0</div>
                                 <div class="text-xs text-gray-500">漫画数</div>
                             </div>
                             <div>
-                                <div class="text-2xl font-bold text-pink-400" id="totalFavorites">0</div>
+                                <div class="stat-number text-xl md:text-2xl font-bold text-pink-400" id="totalFavorites">0</div>
                                 <div class="text-xs text-gray-500">收藏数</div>
                             </div>
                         </div>
                     </div>
+                    <div class="mt-3 md:mt-4">
+                        <a href="/membership" class="text-sm gold-text hover:underline" style="text-decoration:none;">
+                            <i class="fas fa-arrow-up mr-1"></i>升级会员
+                        </a>
+                    </div>
+                </div>
+                
+                <!-- 快捷功能 -->
+                <div class="grid grid-cols-2 gap-3 md:gap-4">
+                    <a href="/my-reports" class="quick-action">
+                        <div class="quick-action-icon" style="background:rgba(59,130,246,0.15);color:#3b82f6;">
+                            <i class="fas fa-chart-pie"></i>
+                        </div>
+                        <div class="quick-action-text">
+                            <h4>我的分析</h4>
+                            <p>查看历史报告</p>
+                        </div>
+                    </a>
+                    <a href="/favorites" class="quick-action">
+                        <div class="quick-action-icon" style="background:rgba(236,72,153,0.15);color:#ec4899;">
+                            <i class="fas fa-heart"></i>
+                        </div>
+                        <div class="quick-action-text">
+                            <h4>我的收藏</h4>
+                            <p>收藏的股票</p>
+                        </div>
+                    </a>
+                    <a href="/settings" class="quick-action">
+                        <div class="quick-action-icon" style="background:rgba(212,175,55,0.15);color:#d4af37;">
+                            <i class="fas fa-cog"></i>
+                        </div>
+                        <div class="quick-action-text">
+                            <h4>偏好设置</h4>
+                            <p>分析与外观设置</p>
+                        </div>
+                    </a>
+                    <a href="/settings/agents" class="quick-action">
+                        <div class="quick-action-icon" style="background:rgba(249,115,22,0.15);color:#f97316;">
+                            <i class="fas fa-robot"></i>
+                        </div>
+                        <div class="quick-action-text">
+                            <h4>Agent 配置</h4>
+                            <p>AI模型设置</p>
+                        </div>
+                    </a>
                 </div>
                 
                 <!-- 基本信息 -->
-                <div class="card rounded-xl p-6">
-                    <h2 class="text-lg font-semibold gold-text mb-4"><i class="fas fa-user mr-2"></i>基本信息</h2>
-                    <form id="profileForm" class="space-y-4">
+                <div class="card p-4 md:p-6">
+                    <h2 class="text-base md:text-lg font-semibold gold-text mb-3 md:mb-4">
+                        <i class="fas fa-user mr-2"></i>基本信息
+                    </h2>
+                    <form id="profileForm" class="space-y-3 md:space-y-4">
                         <div>
-                            <label class="block text-sm text-gray-400 mb-2">邮箱</label>
-                            <input type="email" id="email" disabled class="input-field w-full px-4 py-3 rounded-lg opacity-60">
+                            <label class="block text-sm text-gray-400 mb-1.5">邮箱</label>
+                            <input type="email" id="email" disabled class="input-field w-full px-3 md:px-4 py-2.5 md:py-3 rounded-lg opacity-60">
                         </div>
                         <div>
-                            <label class="block text-sm text-gray-400 mb-2">昵称</label>
-                            <input type="text" id="nickname" class="input-field w-full px-4 py-3 rounded-lg" placeholder="设置昵称">
+                            <label class="block text-sm text-gray-400 mb-1.5">昵称</label>
+                            <input type="text" id="nickname" class="input-field w-full px-3 md:px-4 py-2.5 md:py-3 rounded-lg" placeholder="设置昵称">
                         </div>
                         <div>
-                            <label class="block text-sm text-gray-400 mb-2">姓名</label>
-                            <input type="text" id="name" class="input-field w-full px-4 py-3 rounded-lg" placeholder="真实姓名（可选）">
+                            <label class="block text-sm text-gray-400 mb-1.5">姓名</label>
+                            <input type="text" id="name" class="input-field w-full px-3 md:px-4 py-2.5 md:py-3 rounded-lg" placeholder="真实姓名（可选）">
                         </div>
-                        <button type="submit" class="btn-gold px-6 py-2 rounded-lg">保存修改</button>
+                        <button type="submit" class="btn-gold px-5 md:px-6 py-2.5 rounded-lg text-sm md:text-base w-full sm:w-auto">
+                            <i class="fas fa-save mr-2"></i>保存修改
+                        </button>
                     </form>
                 </div>
                 
                 <!-- 安全设置 -->
-                <div class="card rounded-xl p-6">
-                    <h2 class="text-lg font-semibold gold-text mb-4"><i class="fas fa-shield-alt mr-2"></i>安全设置</h2>
-                    <div class="space-y-4">
-                        <button onclick="showChangePassword()" class="btn-outline w-full py-3 rounded-lg text-left px-4">
-                            <i class="fas fa-key mr-2"></i>修改密码
+                <div class="card p-4 md:p-6">
+                    <h2 class="text-base md:text-lg font-semibold gold-text mb-3 md:mb-4">
+                        <i class="fas fa-shield-alt mr-2"></i>安全设置
+                    </h2>
+                    <div class="space-y-3">
+                        <button onclick="showChangePassword()" class="btn-outline w-full py-3 rounded-lg text-left px-4 text-sm md:text-base flex items-center">
+                            <i class="fas fa-key mr-2 w-5 text-center"></i>修改密码
+                            <i class="fas fa-chevron-right ml-auto text-gray-600 text-xs"></i>
                         </button>
-                        <button onclick="logoutAllDevices()" class="btn-outline w-full py-3 rounded-lg text-left px-4">
-                            <i class="fas fa-sign-out-alt mr-2"></i>登出所有设备
+                        <button onclick="logoutAllDevices()" class="btn-outline w-full py-3 rounded-lg text-left px-4 text-sm md:text-base flex items-center" style="border-color: rgba(239,68,68,0.3); color: #f87171;">
+                            <i class="fas fa-sign-out-alt mr-2 w-5 text-center"></i>登出所有设备
+                            <i class="fas fa-chevron-right ml-auto text-gray-600 text-xs"></i>
                         </button>
                     </div>
                 </div>
                 
                 <!-- 修改密码弹窗 -->
-                <div id="passwordModal" class="hidden fixed inset-0 bg-black/80 flex items-center justify-center z-50">
-                    <div class="card rounded-xl p-6 max-w-md w-full mx-4">
+                <div id="passwordModal" class="hidden fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+                    <div class="card p-5 md:p-6 max-w-md w-full" style="border-color: rgba(212,175,55,0.3);">
                         <div class="flex justify-between items-center mb-4">
-                            <h3 class="text-lg font-semibold gold-text">修改密码</h3>
-                            <button onclick="hideChangePassword()" class="text-gray-400 hover:text-white"><i class="fas fa-times"></i></button>
+                            <h3 class="text-base md:text-lg font-semibold gold-text">修改密码</h3>
+                            <button onclick="hideChangePassword()" class="text-gray-400 hover:text-white p-1"><i class="fas fa-times"></i></button>
                         </div>
-                        <form id="passwordForm" class="space-y-4">
+                        <form id="passwordForm" class="space-y-3 md:space-y-4">
                             <div>
-                                <label class="block text-sm text-gray-400 mb-2">当前密码</label>
-                                <input type="password" name="oldPassword" required class="input-field w-full px-4 py-3 rounded-lg">
+                                <label class="block text-sm text-gray-400 mb-1.5">当前密码</label>
+                                <input type="password" name="oldPassword" required class="input-field w-full px-3 md:px-4 py-2.5 md:py-3 rounded-lg">
                             </div>
                             <div>
-                                <label class="block text-sm text-gray-400 mb-2">新密码</label>
-                                <input type="password" name="newPassword" required minlength="6" class="input-field w-full px-4 py-3 rounded-lg">
+                                <label class="block text-sm text-gray-400 mb-1.5">新密码</label>
+                                <input type="password" name="newPassword" required minlength="6" class="input-field w-full px-3 md:px-4 py-2.5 md:py-3 rounded-lg">
                             </div>
                             <div id="passwordError" class="hidden text-red-400 text-sm"></div>
                             <button type="submit" class="btn-gold w-full py-3 rounded-lg">确认修改</button>
@@ -9139,6 +9467,10 @@ app.get('/account', (c) => {
         document.getElementById('profileForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             const token = localStorage.getItem('accessToken');
+            const btn = e.target.querySelector('button[type="submit"]');
+            const originalText = btn.innerHTML;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>保存中...';
+            btn.disabled = true;
             
             try {
                 const response = await fetch('/api/auth/me', {
@@ -9155,12 +9487,17 @@ app.get('/account', (c) => {
                 const data = await response.json();
                 
                 if (data.success) {
-                    alert('保存成功');
+                    btn.innerHTML = '<i class="fas fa-check mr-2"></i>已保存';
+                    setTimeout(() => { btn.innerHTML = originalText; btn.disabled = false; }, 2000);
                 } else {
                     alert(data.error || '保存失败');
+                    btn.innerHTML = originalText;
+                    btn.disabled = false;
                 }
             } catch (error) {
                 alert('保存失败: ' + error.message);
+                btn.innerHTML = originalText;
+                btn.disabled = false;
             }
         });
         
@@ -9173,6 +9510,11 @@ app.get('/account', (c) => {
             document.getElementById('passwordForm').reset();
             document.getElementById('passwordError').classList.add('hidden');
         }
+        
+        // 点击遮罩关闭弹窗
+        document.getElementById('passwordModal').addEventListener('click', function(e) {
+            if (e.target === this) hideChangePassword();
+        });
         
         document.getElementById('passwordForm').addEventListener('submit', async (e) => {
             e.preventDefault();

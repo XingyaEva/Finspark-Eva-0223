@@ -115,7 +115,7 @@ const registerFormHtml = `
     </div>
 
     <!-- 注册按钮 -->
-    <button type="submit" class="auth-submit-btn" id="registerBtn">
+    <button type="submit" class="auth-submit-btn" id="registerBtn" aria-label="创建账户">
       <span class="btn-text">创建账户</span>
       <span class="btn-loading">
         <span class="auth-spinner"></span>
@@ -133,11 +133,11 @@ const registerFormHtml = `
 
   <!-- 社交登录 -->
   <div class="auth-social-row">
-    <button class="auth-social-btn" onclick="alert('Google 登录功能即将上线')">
+    <button class="auth-social-btn" onclick="alert('Google 登录功能即将上线')" aria-label="Google 注册">
       ${icons.google}
       Google
     </button>
-    <button class="auth-social-btn" onclick="alert('GitHub 登录功能即将上线')">
+    <button class="auth-social-btn" onclick="alert('GitHub 登录功能即将上线')" aria-label="GitHub 注册">
       ${icons.github}
       GitHub
     </button>

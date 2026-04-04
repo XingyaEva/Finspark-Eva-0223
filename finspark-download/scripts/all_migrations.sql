@@ -865,5 +865,66 @@ CREATE INDEX IF NOT EXISTS idx_pref_history_user ON user_preferences_history(use
 CREATE INDEX IF NOT EXISTS idx_pref_history_time ON user_preferences_history(changed_at);
 
 -- =====================================================================
+-- 8. RAG 知识库表
+-- =====================================================================
+
+-- 8.1 RAG文档表
+CREATE TABLE IF NOT EXISTS rag_documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    title TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    file_type TEXT NOT NULL DEFAULT 'text',
+    file_size INTEGER DEFAULT 0,
+    stock_code TEXT,
+    stock_name TEXT,
+    category TEXT DEFAULT 'general',
+    tags TEXT DEFAULT '[]',
+    chunk_count INTEGER DEFAULT 0,
+    embedding_model TEXT,
+    status TEXT DEFAULT 'pending',
+    error_message TEXT,
+    metadata TEXT DEFAULT '{}',
+    created_at DATETIME DEFAULT (datetime('now')),
+    updated_at DATETIME DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_rag_documents_user ON rag_documents(user_id);
+CREATE INDEX IF NOT EXISTS idx_rag_documents_stock ON rag_documents(stock_code);
+CREATE INDEX IF NOT EXISTS idx_rag_documents_status ON rag_documents(status);
+CREATE INDEX IF NOT EXISTS idx_rag_documents_category ON rag_documents(category);
+
+-- 8.2 RAG文档分块表
+CREATE TABLE IF NOT EXISTS rag_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    content_length INTEGER DEFAULT 0,
+    embedding_key TEXT,
+    has_embedding INTEGER DEFAULT 0,
+    metadata TEXT DEFAULT '{}',
+    created_at DATETIME DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_rag_chunks_document ON rag_chunks(document_id);
+CREATE INDEX IF NOT EXISTS idx_rag_chunks_embedding ON rag_chunks(has_embedding);
+
+-- 8.3 RAG对话历史表
+CREATE TABLE IF NOT EXISTS rag_conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    sources TEXT DEFAULT '[]',
+    metadata TEXT DEFAULT '{}',
+    created_at DATETIME DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_rag_conversations_session ON rag_conversations(session_id);
+CREATE INDEX IF NOT EXISTS idx_rag_conversations_user ON rag_conversations(user_id);
+
+-- =====================================================================
 -- 完成
 -- =====================================================================

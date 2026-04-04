@@ -10,7 +10,7 @@ import { createAuthService } from '../services/auth';
 import { createUserService, type MembershipTier } from '../services/user';
 import type { Bindings, AnalysisReport } from '../types';
 
-const reports = new Hono<{ Bindings: Bindings }>();
+const reports = new Hono<{ Bindings: Bindings; Variables: { userId: number } }>();
 
 // ============ 漫画生成进度 API ============
 reports.get('/:id/comic/progress', async (c) => {
@@ -53,7 +53,7 @@ reports.get('/:id/comic/progress', async (c) => {
 // ============ 获取报告列表 (需认证) ============
 reports.get('/my', authMiddleware(), async (c) => {
   try {
-    const userId = c.get('userId');
+    const userId = c.get('userId') as number;
     const limit = parseInt(c.req.query('limit') || '20');
     const offset = parseInt(c.req.query('offset') || '0');
     
@@ -246,7 +246,7 @@ reports.get('/:id', optionalAuthMiddleware(), async (c) => {
 // ============ 删除报告 (需认证) ============
 reports.delete('/:id', authMiddleware(), async (c) => {
   try {
-    const userId = c.get('userId');
+    const userId = c.get('userId') as number;
     const reportId = parseInt(c.req.param('id'));
     
     if (isNaN(reportId)) {
@@ -369,7 +369,7 @@ reports.get('/:id/pdf', async (c) => {
       companyName: report.company_name,
       companyCode: report.company_code,
       reportDate: new Date(report.created_at).toLocaleDateString('zh-CN'),
-      reportPeriod: report.report_period,
+      reportPeriod: report.report_period ?? undefined,
       includeCharts: true,
       includeComic: includeComic && !!comicData,
       comicData: comicData,
@@ -391,7 +391,7 @@ reports.get('/:id/pdf', async (c) => {
 reports.post('/:id/comic', optionalAuthMiddleware(), async (c) => {
   try {
     const reportId = parseInt(c.req.param('id'));
-    const userId = c.get('userId');
+    const userId = c.get('userId') as number;
     
     // 支持完整的漫画生成配置参数
     const body = await c.req.json<{
@@ -557,7 +557,7 @@ reports.post('/:id/comic', optionalAuthMiddleware(), async (c) => {
     
     // 高质量模式选择
     const useNanoBanana = (body as { useNanoBanana?: boolean }).useNanoBanana === true;
-    const usePromptBuilder = body.usePromptBuilder === true;
+    const usePromptBuilder = (body as { usePromptBuilder?: boolean }).usePromptBuilder === true;
     
     console.log(`[Comic API] Generating comic for ${report.company_name}`);
     console.log(`[Comic API] Config: characterSet=${config.characterSetId}, character=${config.mainCharacterId}, format=${config.outputFormat}, contentStyle=${config.contentStyle}`);
@@ -575,7 +575,7 @@ reports.post('/:id/comic', optionalAuthMiddleware(), async (c) => {
         themeId,
         useMultiCharacter: true,
         letAIChooseCharacters,
-      });
+      } as any);
     } else if (usePromptBuilder) {
       comicResult = await comicService.generateComicWithPromptBuilder(reportData, { ...config, usePromptBuilder: true } as ComicGenerationConfig & { usePromptBuilder?: boolean });
     } else if (useNanoBanana) {
@@ -730,7 +730,7 @@ reports.post('/:id/comic', optionalAuthMiddleware(), async (c) => {
         // 多角色模式使用 themeId，单角色模式使用 characterSetId
         characterSetId: useMultiCharacter ? themeId : (config.characterSetId || 'nezha-movie'),
         mainCharacterId: useMultiCharacter ? 'multi' : (config.mainCharacterId || 'nezha'),
-        mainCharacter: comicResult.comic.mainCharacter,
+        mainCharacter: comicResult.comic.mainCharacter as any,
         // 新增：多角色模式标识和信息
         isMultiCharacter: useMultiCharacter,
         themeId: useMultiCharacter ? themeId : undefined,

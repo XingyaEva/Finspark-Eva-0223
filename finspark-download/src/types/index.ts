@@ -76,6 +76,19 @@ export interface AgentResult {
   status: 'success' | 'error';
   executionTime: number;
   timestamp: Date;
+  /** 综合分析摘要（AI 生成的结构化对象） */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  summary?: any;
+  /** 关键指标列表 */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  keyMetrics?: any[];
+  /** 详细分析（AI 生成的结构化对象） */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  detailedAnalysis?: any;
+  /** 风险因素 */
+  risks?: string[];
+  /** 机会因素 */
+  opportunities?: string[];
 }
 
 // 分析规划结果
@@ -213,6 +226,7 @@ export interface RiskResult extends AgentResult {
     grade: 'safe' | 'moderate' | 'risky' | 'dangerous';
     recommendations: string[];
   };
+  keyRisks?: string[];
 }
 
 // 业务洞察结果
@@ -273,6 +287,8 @@ export interface ForecastResult extends AgentResult {
   confidence: 'high' | 'medium' | 'low';
   risks: string[];
   caveats: string[];
+  targetPrices?: Record<string, unknown>;
+  catalysts?: string[];
 }
 
 // 估值评估结果
@@ -284,6 +300,7 @@ export interface ValuationResult extends AgentResult {
     marketCap: number | string;
     overallAssessment: '低估' | '合理' | '高估' | '严重高估';
     oneSentence: string;
+    valuationLevel?: string;
   };
   relativeValuation: {
     peAnalysis: {
@@ -379,6 +396,9 @@ export interface FinalConclusionResult extends AgentResult {
     isHealthy: boolean;
     score: number;
     summary: string;
+    rating?: string;
+    keyStrengths?: string[];
+    keyWeaknesses?: string[];
   };
   investmentValue: {
     hasLongTermValue: boolean;
@@ -397,6 +417,7 @@ export interface FinalConclusionResult extends AgentResult {
     summary: string;
   };
   keyTakeaways: string[];
+  highlights?: string[];
 }
 
 // ============ 完整分析报告 ============
@@ -419,8 +440,11 @@ export interface AnalysisReport {
   forecastResult?: ForecastResult;
   valuationResult?: ValuationResult;
   trendInterpretations?: TrendInterpretations;  // 趋势解读
+  industryCharacteristics?: Record<string, unknown>;
   finalConclusion?: FinalConclusionResult;
   comicData?: ComicData;
+  dataSource?: Record<string, unknown>;
+  industry?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -430,12 +454,12 @@ export interface ComicData {
   title?: string;
   panels: ComicPanel[];
   summary: string;
-  style: 'business' | 'modern' | 'classic' | 'minimal';
+  style: 'business' | 'modern' | 'classic' | 'minimal' | 'custom' | 'nezha' | 'infographic' | 'prompt-builder' | string;
   mainCharacter?: {
     name: string;
     description: string;
     personality: string;
-  };
+  } | string;
   financialHighlights?: string[];
 }
 
@@ -494,6 +518,14 @@ export interface StartAnalysisRequest {
   agentModelConfig?: AgentModelConfig;
   /** Phase 1: Preset 覆盖 - 允许用户在单次分析中临时使用特定 Preset */
   presetOverrides?: Partial<Record<AgentType, PresetOverride>>;
+  /** 用户分析偏好 - 来自首页配置面板，影响分析深度、风格和模块 */
+  userPreferences?: {
+    analysisDepth?: 'quick' | 'standard' | 'deep';
+    analysisStyle?: 'balanced' | 'prudent' | 'decisive' | 'risk_aware';
+    includeForecast?: boolean;
+    includeIndustryCompare?: boolean;
+    includeComic?: boolean;
+  };
 }
 
 export interface AnalysisProgress {
@@ -516,6 +548,8 @@ export interface IPCharacter {
   catchphrase?: string;           // 标志性台词
   source: string;                 // 来源（如：哪吒之魔童降世）
   suitableFor?: string[];         // 适合的行业类型
+  style?: string;                  // 风格
+  appearance?: string;             // 外观描述
 }
 
 // IP角色集合
@@ -578,4 +612,28 @@ export interface Bindings {
   JWT_SECRET: string;
   /** AKShare Python 代理服务地址 (港股数据) */
   AKSHARE_PROXY_URL?: string;
+  /** MinerU PDF智能解析 API Key (上海AI实验室 OpenDataLab) */
+  MINERU_API_KEY?: string;
+  /** 阿里云百炼 DashScope API Key (通义千问 text-embedding-v4) */
+  DASHSCOPE_API_KEY?: string;
+  /** GPU 服务统一入口 URL (Nginx 反向代理, 如 https://u39-xxxx.region.seetacloud.com:8443) */
+  GPU_SERVER_URL?: string;
+  /** GPU LLM 模型名 (默认 qwen3-14b) */
+  GPU_LLM_MODEL?: string;
+  /** GPU 路由模式: recommended/all_gpu/all_cloud (默认 recommended) */
+  GPU_ROUTING_MODE?: string;
+  /** GPU 代理认证 Token (SSH 隧道代理的 X-GPU-Auth 头) */
+  GPU_PROXY_AUTH_TOKEN?: string;
+  /** Figma Personal Access Token */
+  FIGMA_TOKEN?: string;
+  /** 管理员 API Key */
+  ADMIN_API_KEY?: string;
+  /** KV 缓存 (别名) */
+  KV?: KVNamespace;
+  /** Langfuse 可观测性平台 Secret Key */
+  LANGFUSE_SECRET_KEY?: string;
+  /** Langfuse 可观测性平台 Public Key */
+  LANGFUSE_PUBLIC_KEY?: string;
+  /** Langfuse 可观测性平台 Base URL (默认 https://cloud.langfuse.com) */
+  LANGFUSE_BASE_URL?: string;
 }

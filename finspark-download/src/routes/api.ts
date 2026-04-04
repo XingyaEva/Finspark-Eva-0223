@@ -11,11 +11,12 @@ import { createComicService } from '../services/comic';
 import { createDataSyncService } from '../services/dataSync';
 import { createAgentPresetsService } from '../services/agentPresets';
 import { createOrchestrator } from '../agents/orchestrator';
-import { AGENT_PROMPTS } from '../agents/prompts';
+import { AGENT_PROMPTS, COMIC_PROMPTS } from '../agents/prompts';
 import { optionalAuthMiddleware, optionalAuth, requireFeature } from '../middleware/auth';
 import { generateTabInsights, getCachedInsights, cacheInsights, getInsightCacheTTL } from '../services/stockInsightAgent';
 import { isHKStock } from '../utils/stockCode';
 import { validateReportCompleteness, getValidationLogMessage } from '../utils/reportValidation';
+import { createLangfuseFromEnv, createAnalysisTrace, flushLangfuse } from '../services/langfuse';
 import type { Bindings, StartAnalysisRequest, AnalysisProgress, AnalysisReport, AgentType, ModelPreference, AgentPromptConfig } from '../types';
 
 const api = new Hono<{ Bindings: Bindings }>();
@@ -180,18 +181,23 @@ api.get('/stock/basic/:code', async (c) => {
       localStock = await stockDB.getStockByCode(code);
     }
 
-    // 从 Tushare 获取详细信息
-    const [basic, company, dailyBasic] = await Promise.all([
-      tushare.getStockBasic(code),
-      tushare.getCompanyInfo(code),
-      tushare.getDailyBasic(code),
-    ]);
+    // 从 Tushare 获取详细信息（容错：API 不可用时降级到本地数据）
+    let basic = null, company = null, dailyBasic: any[] = [];
+    try {
+      [basic, company, dailyBasic] = await Promise.all([
+        tushare.getStockBasic(code),
+        tushare.getCompanyInfo(code),
+        tushare.getDailyBasic(code),
+      ]);
+    } catch (tushareError) {
+      console.warn(`[Stock Basic] Tushare API unavailable for ${code}, falling back to local data:`, tushareError instanceof Error ? tushareError.message : tushareError);
+    }
 
     if (!basic && !localStock) {
       return c.json({ success: false, error: '股票不存在' }, 404);
     }
 
-    const latestDaily = dailyBasic[0];
+    const latestDaily = dailyBasic?.[0];
 
     return c.json({
       success: true,
@@ -213,6 +219,7 @@ api.get('/stock/basic/:code', async (c) => {
           marketCap: latestDaily.total_mv,
           close: latestDaily.close,
         } : null,
+        source: basic ? 'tushare' : 'local',
       },
     });
   } catch (error) {
@@ -650,7 +657,7 @@ api.post('/analyze/start', optionalAuthMiddleware(), async (c) => {
         body.companyCode,
         companyName,
         reportType,
-        userId,
+        userId ?? undefined,
         body.reportPeriod
       );
       
@@ -720,16 +727,39 @@ api.post('/analyze/start', optionalAuthMiddleware(), async (c) => {
       }
     });
 
+    // ============ Langfuse 可观测性追踪 ============
+    const langfuseClient = createLangfuseFromEnv(c.env);
+    const langfuseTrace = createAnalysisTrace(langfuseClient, {
+      reportId,
+      companyCode: body.companyCode,
+      companyName: companyName || body.companyCode,
+      reportType,
+      userId: userId ? String(userId) : undefined,
+      reportPeriod: body.reportPeriod,
+    });
+
     // 创建编排器并开始分析 - 带进度回调
     // Phase 0/1: 支持 Agent 独立模型配置 + Preset 系统
     // Phase 2: 支持用户自定义 Prompt 注入
     // Phase 3: 支持港股数据自动路由
+    // Phase 4: 支持用户分析偏好（深度、风格）
+    // Phase 5: 支持 Langfuse 全链路追踪
     const orchestrator = createOrchestrator({
       vectorEngine,
       dataService,  // 使用统一数据服务 (替代 tushare)
       cache,  // 用于趋势解读缓存
       agentModelConfig: effectiveModelConfig,  // 合并后的 Agent 模型配置
       agentPromptConfig: effectivePromptConfig,  // 【新增】用户自定义 Prompt 配置
+      userPreferences: body.userPreferences,  // 【新增】用户分析偏好（深度、风格、模块开关）
+      langfuseTrace,  // 【新增】Langfuse 全链路追踪
+      // 【新增】OpenEvals 评估配置 (Langfuse + OpenEvals 联合测试)
+      evalConfig: langfuseTrace ? {
+        enabled: true,
+        mode: 'sampling' as const,    // 测试阶段: 100% 全量评估
+        samplingRate: 1.0,            // TODO: 上线后改回 0.1
+        judgeModel: 'gpt-4.1',        // Judge 模型
+        enableCrossConsistency: true,  // 测试阶段: 开启 Layer3 跨Agent一致性
+      } : undefined,
       onProgress: async (progress) => {
         // 实时更新进度到 KV/D1
         if (currentReportsService) {
@@ -859,6 +889,9 @@ api.post('/analyze/start', optionalAuthMiddleware(), async (c) => {
         }
         
         console.log(`Analysis completed for report ${reportId}`);
+
+        // Langfuse: 刷新缓冲区确保所有事件发送
+        await flushLangfuse(langfuseClient);
       } catch (error) {
         console.error(`Analysis failed for report ${reportId}:`, error);
         
@@ -877,6 +910,9 @@ api.post('/analyze/start', optionalAuthMiddleware(), async (c) => {
             { expirationTtl: 3600 }
           );
         }
+
+        // Langfuse: 即使失败也要刷新缓冲区
+        await flushLangfuse(langfuseClient);
       }
     })();
 
@@ -1173,7 +1209,7 @@ api.post('/analyze/force-reanalyze', optionalAuthMiddleware(), async (c) => {
         body.companyCode,
         companyName,
         reportType,
-        userId,
+        userId ?? undefined,
         body.reportPeriod
       );
       
@@ -1224,14 +1260,36 @@ api.post('/analyze/force-reanalyze', optionalAuthMiddleware(), async (c) => {
       }
     });
 
+    // ============ Langfuse 可观测性追踪 (force-reanalyze) ============
+    const langfuseClient2 = createLangfuseFromEnv(c.env);
+    const langfuseTrace2 = createAnalysisTrace(langfuseClient2, {
+      reportId,
+      companyCode: body.companyCode,
+      companyName: companyName || body.companyCode,
+      reportType: body.reportType || 'annual',
+      userId: userId ? String(userId) : undefined,
+      reportPeriod: body.reportPeriod,
+    });
+
     // 创建编排器
     // Phase 0/1: 支持 Agent 独立模型配置 + Preset 系统
     // Phase 3: 支持港股数据自动路由
+    // Phase 4: 支持用户分析偏好
+    // Phase 5: 支持 Langfuse 全链路追踪
     const orchestrator = createOrchestrator({
       vectorEngine,
       dataService,  // 使用统一数据服务 (替代 tushare)
       cache,  // 用于趋势解读缓存
       agentModelConfig: effectiveModelConfig,  // 合并后的 Agent 模型配置
+      userPreferences: body.userPreferences,  // 用户分析偏好
+      langfuseTrace: langfuseTrace2,  // 【新增】Langfuse 全链路追踪
+      // 【新增】OpenEvals 评估配置 (force-reanalyze 启用全量评估)
+      evalConfig: langfuseTrace2 ? {
+        enabled: true,
+        mode: 'full' as const,         // 全量评估 (force-reanalyze 用于深度质检)
+        judgeModel: 'gpt-4.1',
+        enableCrossConsistency: true,   // 启用 Layer3 跨Agent一致性
+      } : undefined,
       onProgress: async (progress) => {
         if (currentReportsService) {
           await currentReportsService.updateProgress(reportId, progress);
@@ -1339,6 +1397,7 @@ api.post('/analyze/force-reanalyze', optionalAuthMiddleware(), async (c) => {
         }
         
         console.log(`[Force Reanalyze] Completed for report ${reportId}`);
+        await flushLangfuse(langfuseClient2);
       } catch (error) {
         console.error(`[Force Reanalyze] Failed for report ${reportId}:`, error);
         
@@ -1355,6 +1414,7 @@ api.post('/analyze/force-reanalyze', optionalAuthMiddleware(), async (c) => {
             { expirationTtl: 3600 }
           );
         }
+        await flushLangfuse(langfuseClient2);
       }
     })();
 
@@ -1892,7 +1952,7 @@ api.get('/analyze/industry-comparison/:code', optionalAuth(), requireFeature('in
     const peersDataDescription = codesToCompare.map(stockCode => {
       const income = comparisonData.income[stockCode];
       const fina = comparisonData.fina[stockCode];
-      const peer = stockCode === peersResult.targetStock.code 
+      const peer = stockCode === peersResult.targetStock?.code 
         ? peersResult.targetStock 
         : peersResult.peers.find(p => p.code === stockCode);
       
@@ -1929,8 +1989,8 @@ ${JSON.stringify(metrics, null, 2)}
     // 调用AI进行深度分析（使用JSON专用方法确保格式正确）
     const aiAnalysis = await vectorEngine.analyzeFinancialReportJson(
       AGENT_PROMPTS.INDUSTRY_COMPARISON
-        .replace('{targetCompany}', `${peersResult.targetStock.name}（${peersResult.targetStock.code}）`)
-        .replace('{industry}', peersResult.industry)
+        .replace('{targetCompany}', `${peersResult.targetStock?.name ?? ''}（${peersResult.targetStock?.code ?? ''}）`)
+        .replace('{industry}', String(peersResult.industry))
         .replace('{peers}', peersResult.peers.map(p => `${p.name}（${p.code}）`).join('、'))
         .replace('{comparisonData}', peersDataDescription),
       prompt
@@ -2088,7 +2148,7 @@ api.get('/analyze/trend-interpretation/:code', async (c) => {
     };
     
     // 获取行业配置，如果没有则使用默认配置
-    const industryCharacteristics = AGENT_PROMPTS.INDUSTRY_CHARACTERISTICS as Record<string, typeof defaultIndustryConfig> | undefined;
+    const industryCharacteristics = COMIC_PROMPTS.INDUSTRY_CHARACTERISTICS as unknown as Record<string, typeof defaultIndustryConfig> | undefined;
     const industryConfig = industryCharacteristics?.[industry] || industryCharacteristics?.['default'] || defaultIndustryConfig;
     
     const prompt = `
@@ -2113,7 +2173,7 @@ ${JSON.stringify(mergedData, null, 2)}
 `;
 
     const result = await vectorEngine.analyzeFinancialReportJson(
-      AGENT_PROMPTS.TREND_INTERPRETATION,
+      COMIC_PROMPTS.TREND_INTERPRETATION,
       prompt
     );
     
@@ -2131,7 +2191,7 @@ ${JSON.stringify(mergedData, null, 2)}
     // 格式2: { netProfit: {...}, ... } => 直接使用
     if (interpretations && interpretations.trend_analysis && typeof interpretations.trend_analysis === 'object') {
       console.log('[TrendInterpretation API] 检测到 trend_analysis 嵌套结构，提取内部数据');
-      interpretations = interpretations.trend_analysis;
+      interpretations = interpretations.trend_analysis as Record<string, unknown>;
     }
     
     console.log('[TrendInterpretation API] 解析完成，指标数量:', Object.keys(interpretations || {}).length);

@@ -812,7 +812,7 @@ ${subPanelsDescription}
 === CHARACTER ===
 Character: ${character.name} (${character.displayName})
 Visual style: ${character.visualStyle}
-Action: ${panel.action || panel.characterAction || 'presenting information'}
+Action: ${panel.action || (panel as any).characterAction || 'presenting information'}
 Expression: ${panel.mood === '积极' ? 'happy, enthusiastic' : panel.mood === '谨慎' ? 'thoughtful, careful' : 'professional, confident'}
 Speech bubble: "${panel.dialogue || ''}"
 Position: Integrated with layout, not blocking key information

@@ -18,7 +18,19 @@ import {
 } from '../services/tushare';
 import { StockDataService } from '../services/stockDataService';
 import { normalizeStockCode } from '../utils/stockCode';
-import { AGENT_PROMPTS, AGENT_NAMES, AGENT_PHASES } from './prompts';
+import { AGENT_PROMPTS, AGENT_NAMES, AGENT_PHASES, COMIC_PROMPTS } from './prompts';
+import { getModelAwareResponseFormat } from './schemas';
+import { applyPersonalityToPrompt, type PersonalityId } from '../services/analysisPersonality';
+import type { TraceContext } from '../services/langfuse';
+import {
+  createPhaseSpan,
+  startGeneration,
+  endGeneration,
+  recordScore,
+  finalizeTrace,
+} from '../services/langfuse';
+import type { EvalConfig, OpenEvalsEvaluator, LLMCallFn } from '../services/openevals-evaluator';
+import { createOpenEvalsEvaluator } from '../services/openevals-evaluator';
 import type {
   AnalysisReport,
   PlanningResult,
@@ -48,6 +60,18 @@ export interface OrchestratorConfig {
   onProgress?: (progress: AnalysisProgress) => void;
   agentModelConfig?: AgentModelConfig;  // Agent 独立模型配置
   agentPromptConfig?: AgentPromptConfig;  // 用户自定义 Prompt 配置
+  /** 用户分析偏好 - 影响分析风格和深度 */
+  userPreferences?: {
+    analysisDepth?: 'quick' | 'standard' | 'deep';
+    analysisStyle?: 'balanced' | 'prudent' | 'decisive' | 'risk_aware';
+    includeForecast?: boolean;
+    includeIndustryCompare?: boolean;
+    includeComic?: boolean;
+  };
+  /** Langfuse 追踪上下文 (可选, 由 API 层创建并传入) */
+  langfuseTrace?: TraceContext | null;
+  /** OpenEvals 评估配置 (可选, 用于 LLM-as-Judge 质量评估) */
+  evalConfig?: EvalConfig;
 }
 
 export interface AnalysisOptions {
@@ -60,6 +84,13 @@ export interface AnalysisOptions {
   /** @deprecated 业绩预测已改为必选，此参数将被忽略 */
   includeForecast?: boolean;
   agentModelConfig?: AgentModelConfig;  // 可在分析时覆盖模型配置
+  /** 用户分析偏好 */
+  userPreferences?: {
+    analysisDepth?: 'quick' | 'standard' | 'deep';
+    analysisStyle?: 'balanced' | 'prudent' | 'decisive' | 'risk_aware';
+    includeForecast?: boolean;
+    includeIndustryCompare?: boolean;
+  };
 }
 
 export interface FinancialData {
@@ -86,6 +117,18 @@ export class AnalysisOrchestrator {
   private totalAgents = 10;
   private agentModelConfig: AgentModelConfig;
   private agentPromptConfig: AgentPromptConfig;
+  /** Langfuse 追踪上下文 */
+  private langfuseTrace: TraceContext | null;
+  /** OpenEvals 评估器 */
+  private evaluator: OpenEvalsEvaluator | null = null;
+  /** 用户分析偏好（深度、风格等） */
+  private userPreferences: {
+    analysisDepth: string;
+    analysisStyle: string;
+    includeForecast: boolean;
+    includeIndustryCompare: boolean;
+    includeComic: boolean;
+  };
 
   // 趋势解读缓存TTL：90天（一个季度）
   private static TREND_CACHE_TTL = 90 * 24 * 60 * 60;
@@ -107,12 +150,84 @@ export class AnalysisOrchestrator {
     };
     // 初始化用户 Prompt 配置（默认为空对象）
     this.agentPromptConfig = config.agentPromptConfig || {};
+    // Langfuse 追踪上下文
+    this.langfuseTrace = config.langfuseTrace || null;
+    // OpenEvals 评估器: 使用 VectorEngine 作为 Judge 模型后端
+    if (config.evalConfig && config.evalConfig.enabled !== false && config.evalConfig.mode !== 'off') {
+      const llmCallFn: LLMCallFn = async (systemPrompt, userPrompt, options) => {
+        return this.vectorEngine.analyzeFinancialReportJson(systemPrompt, userPrompt, {
+          model: options?.model,
+        });
+      };
+      this.evaluator = createOpenEvalsEvaluator(llmCallFn, this.langfuseTrace, config.evalConfig);
+      console.log(`[Orchestrator] OpenEvals 评估已启用: 模式=${config.evalConfig.mode || 'sampling'}, Judge=${config.evalConfig.judgeModel || 'gpt-4.1'}`);
+    }
+    // 初始化用户分析偏好
+    this.userPreferences = {
+      analysisDepth: config.userPreferences?.analysisDepth || 'standard',
+      analysisStyle: config.userPreferences?.analysisStyle || 'balanced',
+      includeForecast: config.userPreferences?.includeForecast !== false,
+      includeIndustryCompare: config.userPreferences?.includeIndustryCompare !== false,
+      includeComic: config.userPreferences?.includeComic !== false,
+    };
     
     // 日志记录使用的数据服务
     if (this.dataService) {
       console.log('[Orchestrator] 使用统一数据服务 (支持 A股 + 港股)');
     } else if (this.tushare) {
       console.log('[Orchestrator] 使用 Tushare 数据服务 (仅 A股)');
+    }
+    
+    // 日志记录用户偏好
+    if (config.userPreferences) {
+      console.log(`[Orchestrator] 用户偏好: 深度=${this.userPreferences.analysisDepth}, 风格=${this.userPreferences.analysisStyle}, 预测=${this.userPreferences.includeForecast}, 行业对比=${this.userPreferences.includeIndustryCompare}`);
+    }
+  }
+
+  /**
+   * 带 Langfuse 追踪的 Agent LLM 调用
+   * 自动记录 Generation（prompt / response / tokens / 延迟 / JSON 合规性）
+   */
+  private async tracedAgentCall(
+    agentType: string,
+    agentName: string,
+    phase: number,
+    model: string,
+    systemPrompt: string,
+    userPrompt: string,
+    callFn: () => Promise<string>,
+  ): Promise<string> {
+    const gen = startGeneration(this.langfuseTrace, {
+      agentType,
+      agentName,
+      phase,
+      model,
+      systemPrompt,
+      userPrompt,
+    });
+
+    const t0 = Date.now();
+    let result = '';
+    let error: string | undefined;
+
+    try {
+      result = await callFn();
+      return result;
+    } catch (err: unknown) {
+      error = err instanceof Error ? err.message : String(err);
+      throw err;
+    } finally {
+      const latencyMs = Date.now() - t0;
+      // 简单 JSON 合规检测
+      let jsonValid = false;
+      try { JSON.parse(result); jsonValid = true; } catch { /* ignore */ }
+
+      endGeneration(gen, {
+        content: result,
+        latencyMs,
+        jsonValid,
+        error,
+      });
     }
   }
 
@@ -142,23 +257,45 @@ export class AnalysisOrchestrator {
   }
 
   /**
-   * 合并系统 Prompt 与用户自定义 Prompt
+   * 合并系统 Prompt 与用户自定义 Prompt 和分析偏好
    * 
-   * 策略：将用户 Prompt 追加到原始 System Prompt 末尾
-   * - 使用分隔标记明确区分
-   * - 保留 JSON 输出格式约束
-   * - 最大长度限制 2000 字符
+   * 策略：
+   * 1. 应用分析风格（人格修饰词）
+   * 2. 应用分析深度指令
+   * 3. 追加用户自定义 Prompt
    * 
    * @param systemPrompt 原始 System Prompt（来自 AGENT_PROMPTS）
    * @param agentType Agent 类型，用于查找用户配置
    * @returns 合并后的 System Prompt
    */
   private mergeSystemPrompt(systemPrompt: string, agentType: keyof AgentPromptConfig): string {
+    let prompt = systemPrompt;
+    
+    // Step 1: 应用分析风格（人格修饰词）- 如果不是 balanced/默认
+    const analysisStyle = this.userPreferences.analysisStyle;
+    if (analysisStyle && analysisStyle !== 'balanced') {
+      const personalityId = analysisStyle as PersonalityId;
+      // applyPersonalityToPrompt 会检查是否有该 Agent 的修饰词
+      prompt = applyPersonalityToPrompt(prompt, personalityId, agentType as any);
+      console.log(`[Orchestrator] 应用分析风格: ${analysisStyle} for Agent=${String(agentType)}`);
+    }
+    
+    // Step 2: 应用分析深度指令
+    const depth = this.userPreferences.analysisDepth;
+    if (depth && depth !== 'standard') {
+      const depthModifier = depth === 'quick' 
+        ? `\n\n## 分析深度要求：快速分析\n请简化分析内容，聚焦关键指标和核心结论。减少冗余描述，优先产出可直接参考的观点。每个分析维度给出1-2个核心发现即可。`
+        : `\n\n## 分析深度要求：深度分析\n请进行深入详细的分析，包括：多维度交叉验证、历史趋势对比、行业上下文分析、关键假设敏感性分析。每个发现都应有充分的数据支撑和逻辑推理。`;
+      prompt += depthModifier;
+      console.log(`[Orchestrator] 应用分析深度: ${depth} for Agent=${String(agentType)}`);
+    }
+    
+    // Step 3: 合并用户自定义 Prompt
     const userCustomPrompt = this.agentPromptConfig[agentType];
     
-    // 如果没有用户自定义 Prompt，直接返回原始 Prompt
+    // 如果没有用户自定义 Prompt，直接返回
     if (!userCustomPrompt || userCustomPrompt.trim() === '') {
-      return systemPrompt;
+      return prompt;
     }
     
     // 截断过长的用户 Prompt
@@ -172,7 +309,7 @@ export class AnalysisOrchestrator {
     console.log(`[Orchestrator] 合并用户 Prompt: Agent=${String(agentType)}, 长度=${trimmedUserPrompt.length}字符`);
     
     // 追加用户 Prompt 到末尾，使用分隔标记
-    return `${systemPrompt}
+    return `${prompt}
 
 ---
 ## 用户自定义分析指令（请优先遵循以下要求）
@@ -196,7 +333,9 @@ ${trimmedUserPrompt}
 
     // 1. 获取财务数据
     this.reportProgress('数据获取');
+    const dataSpan = createPhaseSpan(this.langfuseTrace, 0, '数据获取');
     const financialData = await this.fetchFinancialData(options.companyCode, options.reportPeriod);
+    dataSpan?.end();
     
     // 识别市场类型 (A股/港股)
     const { market } = normalizeStockCode(options.companyCode);
@@ -207,11 +346,14 @@ ${trimmedUserPrompt}
 
     // 2. Planning Agent
     this.reportProgress('分析规划');
+    const planSpan = createPhaseSpan(this.langfuseTrace, 0, '分析规划');
     const planningResult = await this.runPlanningAgent(financialData, options);
     this.markCompleted('PLANNING');
+    planSpan?.end();
 
     // 3. Phase 1: 并行执行三表分析
     this.reportProgress('三表并行分析');
+    const phase1Span = createPhaseSpan(this.langfuseTrace, 1, '三表并行分析');
     const [profitabilityResult, balanceSheetResult, cashFlowResult] = await Promise.all([
       this.runProfitabilityAgent(financialData),
       this.runBalanceSheetAgent(financialData),
@@ -229,9 +371,11 @@ ${trimmedUserPrompt}
       { profitabilityResult, balanceSheetResult, cashFlowResult }
     );
     this.markCompleted('TREND_INTERPRETATION');
+    phase1Span?.end();
 
     // 4. Phase 2: 依赖执行
     this.reportProgress('深度分析');
+    const phase2Span = createPhaseSpan(this.langfuseTrace, 2, '深度分析');
     const earningsQualityResult = await this.runEarningsQualityAgent(
       profitabilityResult,
       balanceSheetResult,
@@ -247,7 +391,10 @@ ${trimmedUserPrompt}
     this.markCompleted('RISK');
     this.markCompleted('BUSINESS_INSIGHT');
 
+    phase2Span?.end();
+
     // 5. Phase 3: 商业模式 + 业绩预测 + 估值评估（全部必选）
+    const phase3Span = createPhaseSpan(this.langfuseTrace, 3, '高级分析');
     let businessModelResult: BusinessModelResult | undefined;
     let forecastResult: ForecastResult | undefined;
     let valuationResult: ValuationResult | undefined;
@@ -282,8 +429,11 @@ ${trimmedUserPrompt}
     );
     this.markCompleted('VALUATION');
 
+    phase3Span?.end();
+
     // 6. Final Phase: 汇总结论
     this.reportProgress('生成结论');
+    const finalSpan = createPhaseSpan(this.langfuseTrace, 4, '汇总结论');
     const finalConclusion = await this.runFinalConclusionAgent({
       profitabilityResult,
       balanceSheetResult,
@@ -296,8 +446,91 @@ ${trimmedUserPrompt}
       valuationResult,
     });
     this.markCompleted('FINAL_CONCLUSION');
+    finalSpan?.end();
 
     const executionTime = Date.now() - startTime;
+
+    // ============ OpenEvals 评估阶段 (异步, 不阻塞主流程) ============
+    if (this.evaluator) {
+      const evalSpan = createPhaseSpan(this.langfuseTrace, 5, 'OpenEvals评估');
+      try {
+        console.log('[Orchestrator] 开始 OpenEvals 评估...');
+        const financialDataStr = JSON.stringify(financialData).slice(0, 6000);
+
+        // 并行评估所有 Agent 输出
+        await Promise.all([
+          this.evaluator.evaluateAgent('PLANNING', financialDataStr, JSON.stringify(planningResult)),
+          this.evaluator.evaluateAgent('PROFITABILITY', financialDataStr, JSON.stringify(profitabilityResult)),
+          this.evaluator.evaluateAgent('BALANCE_SHEET', financialDataStr, JSON.stringify(balanceSheetResult)),
+          this.evaluator.evaluateAgent('CASH_FLOW', financialDataStr, JSON.stringify(cashFlowResult)),
+          this.evaluator.evaluateAgent('EARNINGS_QUALITY',
+            JSON.stringify({ profitabilityResult, balanceSheetResult, cashFlowResult }).slice(0, 6000),
+            JSON.stringify(earningsQualityResult),
+          ),
+          this.evaluator.evaluateAgent('RISK',
+            JSON.stringify({ balanceSheetResult, cashFlowResult, earningsQualityResult }).slice(0, 6000),
+            JSON.stringify(riskResult),
+          ),
+          this.evaluator.evaluateAgent('BUSINESS_INSIGHT', financialDataStr, JSON.stringify(businessInsightResult)),
+          businessModelResult
+            ? this.evaluator.evaluateAgent('BUSINESS_MODEL',
+                JSON.stringify(businessInsightResult).slice(0, 4000),
+                JSON.stringify(businessModelResult))
+            : Promise.resolve(null),
+          forecastResult
+            ? this.evaluator.evaluateAgent('FORECAST',
+                JSON.stringify(profitabilityResult).slice(0, 4000),
+                JSON.stringify(forecastResult))
+            : Promise.resolve(null),
+          valuationResult
+            ? this.evaluator.evaluateAgent('VALUATION', financialDataStr, JSON.stringify(valuationResult))
+            : Promise.resolve(null),
+          this.evaluator.evaluateAgent('FINAL_CONCLUSION',
+            JSON.stringify({
+              profitabilityResult, balanceSheetResult, cashFlowResult,
+              earningsQualityResult, riskResult, businessInsightResult,
+            }).slice(0, 8000),
+            JSON.stringify(finalConclusion),
+          ),
+          trendInterpretations
+            ? this.evaluator.evaluateAgent('TREND_INTERPRETATION', financialDataStr, JSON.stringify(trendInterpretations))
+            : Promise.resolve(null),
+        ]);
+
+        // Layer 3: 跨 Agent 一致性评估
+        const allOutputsSummary = JSON.stringify({
+          profitability: profitabilityResult?.summary,
+          balanceSheet: balanceSheetResult?.summary,
+          cashFlow: cashFlowResult?.summary,
+          risk: riskResult?.summary,
+          valuation: valuationResult?.summary,
+          finalConclusion: finalConclusion?.summary,
+        });
+        await this.evaluator.evaluateCrossConsistency(allOutputsSummary);
+
+        // 输出评估摘要
+        console.log(this.evaluator.getSummary());
+
+        // 记录整体评估分到 Langfuse
+        const evalReport = this.evaluator.getReportEvalResult();
+        recordScore(this.langfuseTrace, {
+          name: 'eval-overall-score',
+          value: evalReport.overallScore,
+          comment: `OpenEvals 整体评分 (${evalReport.agentResults.filter(r => !r.skipped).length} agents evaluated)`,
+        });
+      } catch (evalError) {
+        console.error('[Orchestrator] OpenEvals 评估失败 (不影响主分析):', evalError);
+      }
+      evalSpan?.end();
+    }
+
+    // Langfuse: 记录最终 Trace 结果
+    finalizeTrace(this.langfuseTrace, {
+      success: true,
+      totalDurationMs: executionTime,
+      totalAgents: this.totalAgents,
+      completedAgents: this.completedAgents.length,
+    });
 
     return {
       companyCode: options.companyCode,
@@ -471,9 +704,11 @@ ${JSON.stringify(data.cashFlow.slice(0, 4), null, 2)}
 `;
 
     const mergedSystemPrompt = this.mergeSystemPrompt(AGENT_PROMPTS.PLANNING, 'PLANNING');
-    const result = await this.vectorEngine.analyzeFinancialReport(
-      mergedSystemPrompt,
-      prompt
+    const planningModel = this.getModelForAgent('PLANNING');
+    const result = await this.tracedAgentCall('PLANNING', AGENT_NAMES.PLANNING || 'Planning', 0, planningModel, mergedSystemPrompt, prompt,
+      () => this.vectorEngine.analyzeFinancialReportJson(mergedSystemPrompt, prompt,
+        { model: planningModel, responseFormat: getModelAwareResponseFormat('PLANNING', planningModel) }
+      ),
     );
 
     return this.parseJsonResult(result, 'PLANNING');
@@ -514,11 +749,12 @@ ${JSON.stringify(finaIndicatorSummary, null, 2)}
 注意：请重点分析ROE、毛利率、净利率的变化趋势及原因，以及费用控制情况。
 `;
 
+    const profitModel = this.getModelForAgent('PROFITABILITY');
     const mergedSystemPrompt = this.mergeSystemPrompt(AGENT_PROMPTS.PROFITABILITY, 'PROFITABILITY');
-    const result = await this.vectorEngine.analyzeFinancialReport(
-      mergedSystemPrompt,
-      prompt,
-      { model: this.getModelForAgent('PROFITABILITY') }
+    const result = await this.tracedAgentCall('PROFITABILITY', AGENT_NAMES.PROFITABILITY, 1, profitModel, mergedSystemPrompt, prompt,
+      () => this.vectorEngine.analyzeFinancialReportJson(mergedSystemPrompt, prompt,
+        { model: profitModel, responseFormat: getModelAwareResponseFormat('PROFITABILITY', profitModel) }
+      ),
     );
 
     return {
@@ -562,11 +798,12 @@ ${JSON.stringify(solvencyIndicators, null, 2)}
 注意：请重点分析流动性风险、偿债能力和资产运营效率。
 `;
 
+    const balanceModel = this.getModelForAgent('BALANCE_SHEET');
     const mergedSystemPrompt = this.mergeSystemPrompt(AGENT_PROMPTS.BALANCE_SHEET, 'BALANCE_SHEET');
-    const result = await this.vectorEngine.analyzeFinancialReport(
-      mergedSystemPrompt,
-      prompt,
-      { model: this.getModelForAgent('BALANCE_SHEET') }
+    const result = await this.tracedAgentCall('BALANCE_SHEET', AGENT_NAMES.BALANCE_SHEET, 1, balanceModel, mergedSystemPrompt, prompt,
+      () => this.vectorEngine.analyzeFinancialReportJson(mergedSystemPrompt, prompt,
+        { model: balanceModel, responseFormat: getModelAwareResponseFormat('BALANCE_SHEET', balanceModel) }
+      ),
     );
 
     return {
@@ -604,11 +841,12 @@ ${JSON.stringify(cashFlowIndicators, null, 2)}
 注意：请重点分析经营现金流与净利润的匹配度、自由现金流质量。
 `;
 
+    const cashFlowModel = this.getModelForAgent('CASH_FLOW');
     const mergedSystemPrompt = this.mergeSystemPrompt(AGENT_PROMPTS.CASH_FLOW, 'CASH_FLOW');
-    const result = await this.vectorEngine.analyzeFinancialReport(
-      mergedSystemPrompt,
-      prompt,
-      { model: this.getModelForAgent('CASH_FLOW') }
+    const result = await this.tracedAgentCall('CASH_FLOW', AGENT_NAMES.CASH_FLOW, 1, cashFlowModel, mergedSystemPrompt, prompt,
+      () => this.vectorEngine.analyzeFinancialReportJson(mergedSystemPrompt, prompt,
+        { model: cashFlowModel, responseFormat: getModelAwareResponseFormat('CASH_FLOW', cashFlowModel) }
+      ),
     );
 
     return {
@@ -643,11 +881,12 @@ ${JSON.stringify(cashFlow, null, 2)}
 请输出JSON格式的分析结果，包含profitToCashValidation、receivablesRisk、freeCashFlowAnalysis、overallQuality字段。
 `;
 
+    const eqModel = this.getModelForAgent('EARNINGS_QUALITY');
     const mergedSystemPrompt = this.mergeSystemPrompt(AGENT_PROMPTS.EARNINGS_QUALITY, 'EARNINGS_QUALITY');
-    const result = await this.vectorEngine.analyzeFinancialReport(
-      mergedSystemPrompt,
-      prompt,
-      { model: this.getModelForAgent('EARNINGS_QUALITY') }
+    const result = await this.tracedAgentCall('EARNINGS_QUALITY', AGENT_NAMES.EARNINGS_QUALITY, 2, eqModel, mergedSystemPrompt, prompt,
+      () => this.vectorEngine.analyzeFinancialReportJson(mergedSystemPrompt, prompt,
+        { model: eqModel, responseFormat: getModelAwareResponseFormat('EARNINGS_QUALITY', eqModel) }
+      ),
     );
 
     return {
@@ -682,11 +921,12 @@ ${JSON.stringify(earningsQuality, null, 2)}
 请输出JSON格式的分析结果，包含debtRisk、liquidityRisk、operationalRisk、overallRisk字段。
 `;
 
+    const riskModel = this.getModelForAgent('RISK');
     const mergedSystemPrompt = this.mergeSystemPrompt(AGENT_PROMPTS.RISK, 'RISK');
-    const result = await this.vectorEngine.analyzeFinancialReport(
-      mergedSystemPrompt,
-      prompt,
-      { model: this.getModelForAgent('RISK') }
+    const result = await this.tracedAgentCall('RISK', AGENT_NAMES.RISK, 2, riskModel, mergedSystemPrompt, prompt,
+      () => this.vectorEngine.analyzeFinancialReportJson(mergedSystemPrompt, prompt,
+        { model: riskModel, responseFormat: getModelAwareResponseFormat('RISK', riskModel) }
+      ),
     );
 
     return {
@@ -751,11 +991,12 @@ ${JSON.stringify(mainBizSummary, null, 2)}
 4. 业务结构优化的方向和潜力
 `;
 
+    const biModel = this.getModelForAgent('BUSINESS_INSIGHT');
     const mergedSystemPrompt = this.mergeSystemPrompt(AGENT_PROMPTS.BUSINESS_INSIGHT, 'BUSINESS_INSIGHT');
-    const result = await this.vectorEngine.analyzeFinancialReport(
-      mergedSystemPrompt,
-      prompt,
-      { model: this.getModelForAgent('BUSINESS_INSIGHT') }
+    const result = await this.tracedAgentCall('BUSINESS_INSIGHT', AGENT_NAMES.BUSINESS_INSIGHT, 2, biModel, mergedSystemPrompt, prompt,
+      () => this.vectorEngine.analyzeFinancialReportJson(mergedSystemPrompt, prompt,
+        { model: biModel, responseFormat: getModelAwareResponseFormat('BUSINESS_INSIGHT', biModel) }
+      ),
     );
 
     return {
@@ -803,11 +1044,12 @@ ${JSON.stringify(mainBizAnalysis, null, 2)}
 5. **业务协同**：各业务板块之间的协同效应
 `;
 
+    const bmModel = this.getModelForAgent('BUSINESS_MODEL');
     const mergedSystemPrompt = this.mergeSystemPrompt(AGENT_PROMPTS.BUSINESS_MODEL, 'BUSINESS_MODEL');
-    const result = await this.vectorEngine.analyzeFinancialReport(
-      mergedSystemPrompt,
-      prompt,
-      { model: this.getModelForAgent('BUSINESS_MODEL') }
+    const result = await this.tracedAgentCall('BUSINESS_MODEL', AGENT_NAMES.BUSINESS_MODEL, 3, bmModel, mergedSystemPrompt, prompt,
+      () => this.vectorEngine.analyzeFinancialReportJson(mergedSystemPrompt, prompt,
+        { model: bmModel, responseFormat: getModelAwareResponseFormat('BUSINESS_MODEL', bmModel) }
+      ),
     );
 
     return {
@@ -892,11 +1134,12 @@ ${JSON.stringify(growthIndicators, null, 2)}
 5. **情景分析**：乐观、基准、悲观三种情景的概率评估
 `;
 
+    const forecastModel = this.getModelForAgent('FORECAST');
     const mergedSystemPrompt = this.mergeSystemPrompt(AGENT_PROMPTS.FORECAST, 'FORECAST');
-    const result = await this.vectorEngine.analyzeFinancialReport(
-      mergedSystemPrompt,
-      prompt,
-      { model: this.getModelForAgent('FORECAST') }
+    const result = await this.tracedAgentCall('FORECAST', AGENT_NAMES.FORECAST, 3, forecastModel, mergedSystemPrompt, prompt,
+      () => this.vectorEngine.analyzeFinancialReportJson(mergedSystemPrompt, prompt,
+        { model: forecastModel, responseFormat: getModelAwareResponseFormat('FORECAST', forecastModel) }
+      ),
     );
 
     return {
@@ -956,7 +1199,7 @@ ${JSON.stringify(growthIndicators, null, 2)}
 - **ROA**: ${latestFina.roa || '未知'}%
 - **EPS**: ${latestFina.eps || '未知'}元
 - **BPS (每股净资产)**: ${latestFina.bps || '未知'}元
-- **毛利率**: ${latestFina.grossprofit_margin || '未知'}%
+- **毛利率**: ${latestFina.gross_margin || '未知'}%
 - **净利率**: ${latestFina.netprofit_margin || '未知'}%
 
 ## 盈利能力分析结果（参考）
@@ -974,11 +1217,12 @@ ${JSON.stringify(balanceSheetResult?.summary || {}, null, 2)}
 4. **买入建议**：当前价位是否具有吸引力
 `;
 
+    const valuationModel = this.getModelForAgent('VALUATION');
     const mergedSystemPrompt = this.mergeSystemPrompt(AGENT_PROMPTS.VALUATION, 'VALUATION');
-    const result = await this.vectorEngine.analyzeFinancialReport(
-      mergedSystemPrompt,
-      prompt,
-      { model: this.getModelForAgent('VALUATION') }
+    const result = await this.tracedAgentCall('VALUATION', AGENT_NAMES.VALUATION, 3, valuationModel, mergedSystemPrompt, prompt,
+      () => this.vectorEngine.analyzeFinancialReportJson(mergedSystemPrompt, prompt,
+        { model: valuationModel, responseFormat: getModelAwareResponseFormat('VALUATION', valuationModel) }
+      ),
     );
 
     return {
@@ -1013,11 +1257,12 @@ ${JSON.stringify(allResults, null, 2)}
 特别注意：在investmentValue中的valuationAssessment字段需结合估值评估结果给出准确判断。
 `;
 
+    const fcModel = this.getModelForAgent('FINAL_CONCLUSION');
     const mergedSystemPrompt = this.mergeSystemPrompt(AGENT_PROMPTS.FINAL_CONCLUSION, 'FINAL_CONCLUSION');
-    const result = await this.vectorEngine.analyzeFinancialReport(
-      mergedSystemPrompt,
-      prompt,
-      { model: this.getModelForAgent('FINAL_CONCLUSION') }
+    const result = await this.tracedAgentCall('FINAL_CONCLUSION', AGENT_NAMES.FINAL_CONCLUSION, 4, fcModel, mergedSystemPrompt, prompt,
+      () => this.vectorEngine.analyzeFinancialReportJson(mergedSystemPrompt, prompt,
+        { model: fcModel, responseFormat: getModelAwareResponseFormat('FINAL_CONCLUSION', fcModel) }
+      ),
     );
 
     return {
@@ -1074,7 +1319,7 @@ ${JSON.stringify(allResults, null, 2)}
     };
     
     // 安全获取行业配置
-    const industryCharacteristics = AGENT_PROMPTS.INDUSTRY_CHARACTERISTICS as Record<string, unknown> | undefined;
+    const industryCharacteristics = COMIC_PROMPTS.INDUSTRY_CHARACTERISTICS as Record<string, unknown> | undefined;
     const industryConfig = industryCharacteristics?.[industry] 
       || industryCharacteristics?.['default'] 
       || defaultIndustryConfig;
@@ -1097,14 +1342,15 @@ ${JSON.stringify(allResults, null, 2)}
     
     // 6. 调用AI生成趋势解读
     try {
-      const mergedSystemPrompt = this.mergeSystemPrompt(AGENT_PROMPTS.TREND_INTERPRETATION, 'TREND_INTERPRETATION');
-      const result = await this.vectorEngine.analyzeFinancialReport(
-        mergedSystemPrompt,
-        prompt,
-        { model: this.getModelForAgent('TREND_INTERPRETATION') }
+      const trendModel = this.getModelForAgent('TREND_INTERPRETATION');
+      const mergedSystemPrompt = this.mergeSystemPrompt(COMIC_PROMPTS.TREND_INTERPRETATION, 'TREND_INTERPRETATION');
+      const result = await this.tracedAgentCall('TREND_INTERPRETATION', '趋势解读', 1, trendModel, mergedSystemPrompt, prompt,
+        () => this.vectorEngine.analyzeFinancialReportJson(mergedSystemPrompt, prompt,
+          { model: trendModel, responseFormat: getModelAwareResponseFormat('TREND_INTERPRETATION', trendModel) }
+        ),
       );
       
-      const interpretations = this.parseJsonResult(result, 'TREND_INTERPRETATION') as TrendInterpretations;
+      const interpretations = this.parseJsonResult(result, 'TREND_INTERPRETATION') as unknown as TrendInterpretations;
       
       // 7. 写入缓存（90天有效期）
       if (this.cache && interpretations) {

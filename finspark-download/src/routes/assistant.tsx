@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { Bindings } from '../types';
 import { createTushareService } from '../services/tushare';
 import { authMiddleware } from '../middleware/auth';
+import { createRAGService, createEmbeddingConfig } from '../services/rag';
 
 const assistant = new Hono<{ Bindings: Bindings }>();
 
@@ -214,7 +215,7 @@ assistant.post('/chat', async (c) => {
     // 如果是股价/行情查询且有股票代码
     if (isKlineQuery && stockCode) {
       try {
-        const tushare = createTushareService(tushareToken || '', env.CACHE, true);
+        const tushare = createTushareService({ token: tushareToken || '', cache: env.CACHE, useProxy: true });
         const dailyData = await tushare.getDailyBasic(stockCode);
         
         if (dailyData && dailyData.length > 0) {
@@ -256,6 +257,32 @@ assistant.post('/chat', async (c) => {
       ? `当前用户正在查看股票：${stockName || stockCode} (${stockCode})${reportId ? '，已有完整的分析报告' : ''}`
       : '用户尚未选择特定股票';
     
+    // RAG知识库增强：检索相关文档内容
+    let ragContext = '';
+    try {
+      if (env.DB && env.CACHE) {
+        const embeddingConfig = createEmbeddingConfig({
+          dashscopeApiKey: env.DASHSCOPE_API_KEY || undefined,
+          vectorengineApiKey: apiKey,
+        });
+        const ragService = createRAGService(env.DB, env.CACHE, apiKey, embeddingConfig);
+        const ragResults = await ragService.searchSimilar(message, {
+          topK: 3,
+          minScore: 0.35,
+          stockCode: stockCode || undefined,
+        });
+        
+        if (ragResults.length > 0) {
+          ragContext = '\n\n【知识库参考资料】\n';
+          ragResults.forEach((item, idx) => {
+            ragContext += `[来源${idx + 1}: ${item.documentTitle}]\n${item.chunk.content.slice(0, 300)}\n\n`;
+          });
+        }
+      }
+    } catch (ragError) {
+      console.error('[Chat] RAG检索失败（不影响主流程）:', ragError);
+    }
+    
     // 调用AI进行通用对话
     const response = await fetch('https://api.vectorengine.ai/v1/chat/completions', {
       method: 'POST',
@@ -273,10 +300,12 @@ assistant.post('/chat', async (c) => {
 2. 分析财报数据和企业表现
 3. 对比行业内公司
 4. 解读市场趋势
+5. 基于知识库文档回答财报相关问题
 
 ${stockContext}
+${ragContext}
 
-请用简洁专业的语言回答问题。回答后，请在最后一行以JSON格式提供2-3个相关的跟进问题建议，格式为：
+请用简洁专业的语言回答问题。${ragContext ? '如果知识库中有相关信息，请优先参考并标注来源。' : ''}回答后，请在最后一行以JSON格式提供2-3个相关的跟进问题建议，格式为：
 [FOLLOW_UP]{"questions":["问题1","问题2","问题3"]}[/FOLLOW_UP]
 
 如果需要具体数据，建议用户点击"全屏模式"使用完整的问数功能。`
@@ -556,7 +585,7 @@ assistant.post('/identify-stocks', async (c) => {
         `).bind(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`).all();
         
         if (searchResult.results && searchResult.results.length > 0) {
-          matchedStocks.push(...(searchResult.results as StockMatch[]));
+          matchedStocks.push(...(searchResult.results as unknown as StockMatch[]));
         }
       }
     }
@@ -842,7 +871,7 @@ assistant.post('/smart-query', async (c) => {
       const excludePatterns = /(走势|行情|涨跌|对比|比较|价格|股价|趋势|分析|怎么样|如何|最近|今天|昨天|表现|和|与|的|了|吗)/g;
       const cleanQuestion = question.replace(excludePatterns, ' ');
       const keywords = (cleanQuestion.match(/[\u4e00-\u9fa5]{2,}|[A-Za-z]+|\d{6}/g) || [])
-        .filter(kw => kw.length >= 2 && kw.length <= 10);
+        .filter((kw: string) => kw.length >= 2 && kw.length <= 10);
       
       console.log('[Smart Query] cleanQuestion:', cleanQuestion, 'keywords:', keywords);
       
@@ -856,7 +885,7 @@ assistant.post('/smart-query', async (c) => {
         `).bind(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`).all();
         
         if (searchResult.results && searchResult.results.length > 0) {
-          matchedStocks.push(...(searchResult.results as StockMatch[]));
+          matchedStocks.push(...(searchResult.results as unknown as StockMatch[]));
         }
       }
       
