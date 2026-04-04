@@ -17,6 +17,7 @@ import rag from './routes/rag';
 import ragEnhance from './routes/rag-enhance';
 import ragOps from './routes/rag-ops';
 import ragKnowledgeRoute from './routes/rag-knowledge';
+import { evalRoutes } from './routes/eval';
 import { assistantPageHtml } from './pages/assistant';
 import { assistantWidgetHtml } from './pages/assistantWidget';
 import { membershipPageHtml } from './pages/membership';
@@ -85,6 +86,7 @@ app.route('/api/rag', rag);
 app.route('/api/rag/enhance', ragEnhance);
 app.route('/api/rag/ops', ragOps);
 app.route('/api/rag/knowledge', ragKnowledgeRoute);
+app.route('/api/eval', evalRoutes);
 
 // 智能问数助手页面 - 全屏模式
 app.get('/assistant', (c) => {
