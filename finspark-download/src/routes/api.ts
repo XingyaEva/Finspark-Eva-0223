@@ -755,10 +755,15 @@ api.post('/analyze/start', optionalAuthMiddleware(), async (c) => {
       // 【新增】OpenEvals 评估配置 (Langfuse + OpenEvals 联合测试)
       evalConfig: langfuseTrace ? {
         enabled: true,
-        mode: 'sampling' as const,    // 测试阶段: 100% 全量评估
-        samplingRate: 1.0,            // TODO: 上线后改回 0.1
-        judgeModel: 'gpt-4.1',        // Judge 模型
-        enableCrossConsistency: true,  // 测试阶段: 开启 Layer3 跨Agent一致性
+        mode: 'sampling' as const,    // 抽样评估
+        samplingRate: 0.3,            // 30% 抽样率 (P2 稳定化: 从 1.0 降至 0.3)
+        judgeModel: 'gpt-4.1',        // 主 Judge 模型
+        fallbackJudgeModel: 'gpt-4.1-mini',  // P2.3: 降级模型
+        maxConcurrency: 2,            // P2.1: 最大并发 2，防止 CPU 超时
+        judgeTimeoutMs: 15000,        // P2.1: 单次 Judge 超时 15s
+        enableCrossConsistency: false, // P2.1: 默认关闭 Layer3 节省 CPU
+        db: db || undefined,          // P2.4: D1 持久化
+        reportId,                     // P2.4: 关联报告 ID
       } : undefined,
       onProgress: async (progress) => {
         // 实时更新进度到 KV/D1
@@ -1288,7 +1293,12 @@ api.post('/analyze/force-reanalyze', optionalAuthMiddleware(), async (c) => {
         enabled: true,
         mode: 'full' as const,         // 全量评估 (force-reanalyze 用于深度质检)
         judgeModel: 'gpt-4.1',
-        enableCrossConsistency: true,   // 启用 Layer3 跨Agent一致性
+        fallbackJudgeModel: 'gpt-4.1-mini',  // P2.3: 降级模型
+        maxConcurrency: 2,            // P2.1: 最大并发 2
+        judgeTimeoutMs: 15000,        // P2.1: 单次 Judge 超时 15s
+        enableCrossConsistency: true,  // force-reanalyze 保留 Layer3
+        db: db || undefined,          // P2.4: D1 持久化
+        reportId,                     // P2.4: 关联报告 ID
       } : undefined,
       onProgress: async (progress) => {
         if (currentReportsService) {
