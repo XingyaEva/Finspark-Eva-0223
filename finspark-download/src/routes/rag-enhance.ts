@@ -15,6 +15,7 @@ import type { Bindings } from '../types';
 import { createTestSetService } from '../services/ragTestSet';
 import { createRAGService, createEmbeddingConfig } from '../services/rag';
 import { createBM25Service } from '../services/ragBm25';
+import { createFTS5Service } from '../services/ragFts5';
 import { createIntentService } from '../services/ragIntent';
 import { createPipelineService } from '../services/ragPipeline';
 import { createGpuProvider } from '../services/ragGpuProvider';
@@ -45,13 +46,14 @@ function createPipelineForEval(env: Bindings) {
     dashscopeApiKey: env.DASHSCOPE_API_KEY || undefined,
     vectorengineApiKey: apiKey,
   });
-  const ragService = createRAGService(env.DB, env.CACHE, apiKey, embeddingConfig);
+  const ragService = createRAGService(env.DB, env.CACHE, apiKey, embeddingConfig, env.VECTORIZE);
   const bm25Service = createBM25Service(env.DB);
+  const fts5Service = createFTS5Service(env.DB);
   
   const intentLlm = gpuProvider.getLlmConfig('intent');
   const intentService = createIntentService(intentLlm.apiKey, intentLlm.baseUrl, intentLlm.model, intentLlm.extraHeaders);
   
-  return createPipelineService(env.DB, env.CACHE, ragService, bm25Service, intentService, apiKey, undefined, gpuProvider);
+  return createPipelineService(env.DB, env.CACHE, ragService, bm25Service, intentService, apiKey, undefined, gpuProvider, fts5Service);
 }
 
 // ==================== 测试集 CRUD ====================

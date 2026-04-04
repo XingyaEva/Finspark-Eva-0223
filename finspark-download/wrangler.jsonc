@@ -25,6 +25,19 @@
       "binding": "CACHE",
       "id": "285fe51274154c798eaccafd90489666"
     }
+  ],
+
+  // Vectorize 向量数据库（RAG 语义检索，替代 KV 全扫方案）
+  // 索引需先通过 wrangler CLI 创建：
+  //   npx wrangler vectorize create finspark-rag-index --dimensions=1024 --metric=cosine
+  //   npx wrangler vectorize create-metadata-index finspark-rag-index --property-name=stock_code --type=string
+  //   npx wrangler vectorize create-metadata-index finspark-rag-index --property-name=document_id --type=number
+  //   npx wrangler vectorize create-metadata-index finspark-rag-index --property-name=category --type=string
+  "vectorize": [
+    {
+      "binding": "VECTORIZE",
+      "index_name": "finspark-rag-index"
+    }
   ]
 
   // 环境变量已在 Cloudflare Dashboard 中配置:

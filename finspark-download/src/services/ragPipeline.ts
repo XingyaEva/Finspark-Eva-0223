@@ -11,6 +11,7 @@
 
 import type { RAGService, ChunkWithScore } from './rag';
 import type { BM25Service, BM25SearchResult } from './ragBm25';
+import type { FTS5Service, FTS5SearchResult } from './ragFts5';
 import type { IntentService, IntentResult } from './ragIntent';
 import type { AutoSyncService } from './ragAutoSync';
 import type { GpuProvider } from './ragGpuProvider';
@@ -88,6 +89,7 @@ export class PipelineService {
   private kv: KVNamespace;
   private ragService: RAGService;
   private bm25Service: BM25Service;
+  private fts5Service?: FTS5Service;  // FTS5 全文检索（替代 BM25，可选）
   private intentService: IntentService;
   private apiKey: string;
   private autoSyncService?: AutoSyncService;
@@ -101,12 +103,14 @@ export class PipelineService {
     intentService: IntentService,
     apiKey: string,
     autoSyncService?: AutoSyncService,
-    gpuProvider?: GpuProvider
+    gpuProvider?: GpuProvider,
+    fts5Service?: FTS5Service
   ) {
     this.db = db;
     this.kv = kv;
     this.ragService = ragService;
     this.bm25Service = bm25Service;
+    this.fts5Service = fts5Service;
     this.intentService = intentService;
     this.apiKey = apiKey;
     this.autoSyncService = autoSyncService;
@@ -191,21 +195,61 @@ export class PipelineService {
           })
       );
 
-      // BM25 检索（如果启用）
+      // 全文检索：优先 FTS5，降级 BM25（如果启用）
       if (config.enableBm25) {
         const bm25Start = Date.now();
-        retrievalPromises.push(
-          this.bm25Service
-            .search(searchQuery, {
-              topK: config.topK * 2,
-              documentIds: config.documentIds,
-              stockCode: config.stockCode,
-            })
-            .then((results) => {
-              bm25Results = results;
-              bm25Latency = Date.now() - bm25Start;
-            })
-        );
+        
+        // 优先使用 FTS5（单次查询，~5ms）
+        if (this.fts5Service) {
+          retrievalPromises.push(
+            this.fts5Service
+              .search(searchQuery, {
+                topK: config.topK * 2,
+                documentIds: config.documentIds,
+                stockCode: config.stockCode,
+              })
+              .then((fts5Results) => {
+                // 将 FTS5 结果转为 BM25SearchResult 格式（兼容下游 mergeAndDedup）
+                bm25Results = fts5Results.map(r => ({
+                  chunkId: r.chunkId,
+                  documentId: r.documentId,
+                  score: r.score,
+                  content: r.content,
+                  matchedTokens: [], // FTS5 不返回匹配的 token 列表
+                }));
+                bm25Latency = Date.now() - bm25Start;
+                console.log(`[Pipeline] FTS5 search: ${bm25Results.length} results in ${bm25Latency}ms`);
+              })
+              .catch((fts5Error) => {
+                console.warn('[Pipeline] FTS5 failed, falling back to BM25:', fts5Error);
+                // 降级到旧 BM25
+                return this.bm25Service
+                  .search(searchQuery, {
+                    topK: config.topK * 2,
+                    documentIds: config.documentIds,
+                    stockCode: config.stockCode,
+                  })
+                  .then((results) => {
+                    bm25Results = results;
+                    bm25Latency = Date.now() - bm25Start;
+                  });
+              })
+          );
+        } else {
+          // FTS5 不可用，直接用旧 BM25
+          retrievalPromises.push(
+            this.bm25Service
+              .search(searchQuery, {
+                topK: config.topK * 2,
+                documentIds: config.documentIds,
+                stockCode: config.stockCode,
+              })
+              .then((results) => {
+                bm25Results = results;
+                bm25Latency = Date.now() - bm25Start;
+              })
+          );
+        }
       }
 
       await Promise.all(retrievalPromises);
@@ -1176,7 +1220,8 @@ export function createPipelineService(
   intentService: IntentService,
   apiKey: string,
   autoSyncService?: AutoSyncService,
-  gpuProvider?: GpuProvider
+  gpuProvider?: GpuProvider,
+  fts5Service?: FTS5Service
 ): PipelineService {
-  return new PipelineService(db, kv, ragService, bm25Service, intentService, apiKey, autoSyncService, gpuProvider);
+  return new PipelineService(db, kv, ragService, bm25Service, intentService, apiKey, autoSyncService, gpuProvider, fts5Service);
 }
