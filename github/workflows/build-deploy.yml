@@ -1,0 +1,125 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main, genspark_ai_developer]
+    paths:
+      - 'finspark-download/src/**'
+      - 'finspark-download/package.json'
+      - 'finspark-download/vite.config.ts'
+      - 'finspark-download/wrangler.jsonc'
+      - '.github/workflows/build-deploy.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'finspark-download/src/**'
+      - 'finspark-download/package.json'
+      - 'finspark-download/vite.config.ts'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build & Verify
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: finspark-download
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: finspark-download/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify build output
+        run: |
+          if [ ! -f dist/_worker.js ]; then
+            echo "ERROR: dist/_worker.js not found after build!"
+            exit 1
+          fi
+          SIZE=$(stat -c%s dist/_worker.js)
+          echo "dist/_worker.js size: ${SIZE} bytes"
+          if [ "$SIZE" -lt 100000 ]; then
+            echo "ERROR: dist/_worker.js seems too small (${SIZE} bytes), build may have failed"
+            exit 1
+          fi
+          echo "Build output verified successfully"
+
+  deploy-preview:
+    name: Deploy Preview
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/genspark_ai_developer'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: finspark-download
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: finspark-download/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Deploy to Cloudflare Pages (Preview)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=genspark-financial-analysis --branch=preview
+          workingDirectory: finspark-download
+
+  deploy-production:
+    name: Deploy Production
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: finspark-download
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: finspark-download/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Deploy to Cloudflare Pages (Production)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=genspark-financial-analysis
+          workingDirectory: finspark-download
