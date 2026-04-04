@@ -296,13 +296,32 @@ export function finalizeTrace(
 
 /**
  * 刷新 Langfuse 缓冲区（确保事件发送）
- * 在 Cloudflare Workers 中必须在 waitUntil 中调用
+ * P2.2: 带重试机制，在 Cloudflare Workers waitUntil 中安全调用
+ * 
+ * @param langfuse Langfuse 客户端
+ * @param maxRetries 最大重试次数（默认 3）
  */
-export async function flushLangfuse(langfuse: Langfuse | null): Promise<void> {
+export async function flushLangfuse(
+  langfuse: Langfuse | null,
+  maxRetries = 3,
+): Promise<void> {
   if (!langfuse) return;
-  try {
-    await langfuse.flushAsync();
-  } catch (error) {
-    console.error('[Langfuse] flush 失败:', error);
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await langfuse.flushAsync();
+      if (attempt > 1) {
+        console.log(`[Langfuse] flush 成功 (第${attempt}次尝试)`);
+      }
+      return;
+    } catch (error) {
+      console.error(`[Langfuse] flush 失败 (第${attempt}/${maxRetries}次):`, error);
+      if (attempt < maxRetries) {
+        // 指数退避: 500ms, 1000ms, 2000ms
+        const backoffMs = 500 * Math.pow(2, attempt - 1);
+        await new Promise(r => setTimeout(r, backoffMs));
+      }
+    }
   }
+  console.error('[Langfuse] flush 最终失败，已放弃');
 }

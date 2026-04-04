@@ -45,6 +45,16 @@ export interface EvalConfig {
   dimensions?: EvalDimension[];
   /** 是否执行 Layer3 跨Agent一致性检查 (默认 false, 仅 full 模式) */
   enableCrossConsistency?: boolean;
+  /** 最大并发评估数 (防止 Workers CPU 超时, 默认 2) */
+  maxConcurrency?: number;
+  /** 单次 Judge 调用超时 (ms, 默认 15000) */
+  judgeTimeoutMs?: number;
+  /** Judge 降级模型 (主模型失败时使用, 默认 gpt-4.1-mini) */
+  fallbackJudgeModel?: string;
+  /** D1 数据库引用 (用于持久化评分) */
+  db?: any;
+  /** 关联的报告 ID */
+  reportId?: number;
 }
 
 export interface EvalScore {
@@ -101,6 +111,12 @@ export class OpenEvalsEvaluator {
   private llmCall: LLMCallFn;
   private langfuseTrace: TraceContext | null;
   private agentResults: AgentEvalResult[] = [];
+  /** 当前正在执行的 Judge 调用数 */
+  private activeCalls = 0;
+  /** Judge 调用失败次数 (用于触发降级) */
+  private judgeFailCount = 0;
+  /** 是否已降级到 fallback 模型 */
+  private degraded = false;
 
   constructor(
     llmCall: LLMCallFn,
@@ -119,6 +135,11 @@ export class OpenEvalsEvaluator {
         'logicalConsistency', 'expressionQuality', 'hallucination',
       ],
       enableCrossConsistency: config?.enableCrossConsistency ?? false,
+      maxConcurrency: config?.maxConcurrency ?? 2,
+      judgeTimeoutMs: config?.judgeTimeoutMs ?? 15000,
+      fallbackJudgeModel: config?.fallbackJudgeModel || 'gpt-4.1-mini',
+      db: config?.db || null,
+      reportId: config?.reportId ?? 0,
     };
   }
 
@@ -133,8 +154,45 @@ export class OpenEvalsEvaluator {
   }
 
   /**
+   * 获取当前实际使用的 Judge 模型 (考虑降级)
+   */
+  private getCurrentJudgeModel(): string {
+    return this.degraded ? this.config.fallbackJudgeModel : this.config.judgeModel;
+  }
+
+  /**
+   * 带超时的 Promise 包装
+   */
+  private withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`[OpenEvals] ${label} 超时 (${ms}ms)`));
+      }, ms);
+      promise.then(
+        val => { clearTimeout(timer); resolve(val); },
+        err => { clearTimeout(timer); reject(err); },
+      );
+    });
+  }
+
+  /**
+   * 并发控制信号量 — 等待直到有空闲 slot
+   */
+  private async acquireSlot(): Promise<void> {
+    while (this.activeCalls >= this.config.maxConcurrency) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+    this.activeCalls++;
+  }
+
+  private releaseSlot(): void {
+    this.activeCalls = Math.max(0, this.activeCalls - 1);
+  }
+
+  /**
    * 执行单个 LLM-as-Judge 评估
-   * 返回 0-1 的评分和评审理由
+   * P2.1: 并发限制 + 超时控制
+   * P2.3: 主模型失败 → 自动降级到 fallback 模型
    */
   private async runJudge(
     prompt: string,
@@ -145,18 +203,56 @@ export class OpenEvalsEvaluator {
       .replace('{inputs}', inputs)
       .replace('{outputs}', outputs);
 
+    await this.acquireSlot();
     try {
-      const response = await this.llmCall(
-        '你是专业的财务分析质量评审专家。请严格按照JSON格式返回评估结果。',
-        filledPrompt,
-        { model: this.config.judgeModel, temperature: 0.1 },
+      const model = this.getCurrentJudgeModel();
+      const response = await this.withTimeout(
+        this.llmCall(
+          '你是专业的财务分析质量评审专家。请严格按照JSON格式返回评估结果。',
+          filledPrompt,
+          { model, temperature: 0.1 },
+        ),
+        this.config.judgeTimeoutMs,
+        `Judge(${model})`,
       );
 
-      // 解析 Judge 响应
+      // 成功：重置失败计数
+      if (this.degraded) {
+        // 降级模型成功，保持降级
+      } else {
+        this.judgeFailCount = 0;
+      }
       return this.parseJudgeResponse(response);
     } catch (error) {
-      console.error('[OpenEvals] Judge 调用失败:', error);
+      this.judgeFailCount++;
+      const currentModel = this.getCurrentJudgeModel();
+      console.error(`[OpenEvals] Judge(${currentModel}) 调用失败 (第${this.judgeFailCount}次):`, error);
+
+      // 连续失败 2 次 → 降级到 fallback 模型
+      if (!this.degraded && this.judgeFailCount >= 2) {
+        this.degraded = true;
+        console.warn(`[OpenEvals] ⚠️ 降级: ${this.config.judgeModel} → ${this.config.fallbackJudgeModel}`);
+
+        // 用 fallback 模型重试一次
+        try {
+          const response = await this.withTimeout(
+            this.llmCall(
+              '你是专业的财务分析质量评审专家。请严格按照JSON格式返回评估结果。',
+              filledPrompt,
+              { model: this.config.fallbackJudgeModel, temperature: 0.1 },
+            ),
+            this.config.judgeTimeoutMs,
+            `Judge(${this.config.fallbackJudgeModel})-retry`,
+          );
+          return this.parseJudgeResponse(response);
+        } catch (retryError) {
+          console.error('[OpenEvals] Fallback Judge 也失败:', retryError);
+        }
+      }
+
       return { dimension: 'unknown', score: -1, reasoning: `评估失败: ${error}` };
+    } finally {
+      this.releaseSlot();
     }
   }
 
@@ -240,7 +336,7 @@ export class OpenEvalsEvaluator {
 
     const scores: AgentEvalResult['scores'] = {};
 
-    // 并行执行多维度评估
+    // 并发受限的多维度评估 (P2.1: maxConcurrency 控制)
     const evalPromises: Promise<void>[] = [];
 
     // 1. Agent 专用评估 → 映射为 dataAccuracy + professionalInsight
@@ -298,7 +394,7 @@ export class OpenEvalsEvaluator {
       );
     }
 
-    // 等待所有评估完成
+    // 等待所有评估完成 (并发由 acquireSlot/releaseSlot 控制)
     await Promise.all(evalPromises);
 
     // 计算加权综合分
@@ -309,6 +405,9 @@ export class OpenEvalsEvaluator {
 
     // 记录评分到 Langfuse
     this.recordToLangfuse(agentType, scores, weightedTotal);
+
+    // P2.4: 持久化评分到 D1
+    await this.persistToD1(agentType, scores, weightedTotal, evalLatencyMs);
 
     const result: AgentEvalResult = {
       agentType,
@@ -419,6 +518,61 @@ export class OpenEvalsEvaluator {
   }
 
   /**
+   * P2.4: 将评分持久化到 D1 analysis_eval_scores 表
+   */
+  private async persistToD1(
+    agentType: string,
+    scores: AgentEvalResult['scores'],
+    weightedTotal: number,
+    evalLatencyMs: number,
+  ): Promise<void> {
+    const db = this.config.db;
+    const reportId = this.config.reportId;
+    if (!db || !reportId) return;
+
+    try {
+      const judgeModel = this.getCurrentJudgeModel();
+      const scoreEntries = Object.entries(scores)
+        .filter(([, v]) => v && v.score >= 0)
+        .map(([dim, v]) => ({
+          dimension: dim,
+          score: v!.score,
+          reasoning: v!.reasoning?.slice(0, 1000) || '',
+        }));
+
+      // 批量写入各维度分数
+      const stmts = scoreEntries.map(entry =>
+        db.prepare(
+          `INSERT INTO analysis_eval_scores (report_id, agent_type, dimension, score, reasoning, judge_model, eval_latency_ms, degraded)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          reportId, agentType, entry.dimension, entry.score, entry.reasoning,
+          judgeModel, evalLatencyMs, this.degraded ? 1 : 0,
+        ),
+      );
+
+      // 写入加权综合分
+      stmts.push(
+        db.prepare(
+          `INSERT INTO analysis_eval_scores (report_id, agent_type, dimension, score, reasoning, judge_model, eval_latency_ms, degraded)
+           VALUES (?, ?, 'weighted_total', ?, ?, ?, ?, ?)`
+        ).bind(
+          reportId, agentType, weightedTotal,
+          `加权综合评分 (${judgeModel})`,
+          judgeModel, evalLatencyMs, this.degraded ? 1 : 0,
+        ),
+      );
+
+      if (stmts.length > 0) {
+        await db.batch(stmts);
+      }
+    } catch (error) {
+      // 持久化失败不影响主流程
+      console.error(`[OpenEvals] D1 持久化失败 (${agentType}):`, error);
+    }
+  }
+
+  /**
    * 获取完整的报告评估结果
    */
   getReportEvalResult(): ReportEvalResult {
@@ -440,13 +594,18 @@ export class OpenEvalsEvaluator {
     const result = this.getReportEvalResult();
     const evaluated = result.agentResults.filter(r => !r.skipped);
     const skipped = result.agentResults.filter(r => r.skipped);
+    const judgeInfo = this.degraded
+      ? `${this.config.fallbackJudgeModel} (降级自 ${this.config.judgeModel})`
+      : this.config.judgeModel;
 
     const lines = [
       `\n========== OpenEvals 评估摘要 ==========`,
-      `模式: ${this.config.mode} | Judge: ${this.config.judgeModel}`,
+      `模式: ${this.config.mode} | Judge: ${judgeInfo}`,
+      `并发限制: ${this.config.maxConcurrency} | 超时: ${this.config.judgeTimeoutMs}ms`,
       `评估: ${evaluated.length} 个 Agent | 跳过: ${skipped.length} 个`,
       `整体评分: ${result.overallScore.toFixed(3)}`,
-    ];
+      this.degraded ? `⚠️ 已降级到 fallback 模型 (失败${this.judgeFailCount}次)` : '',
+    ].filter(Boolean);
 
     for (const r of evaluated) {
       const dims = Object.entries(r.scores)
