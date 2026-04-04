@@ -55,6 +55,8 @@ export interface EvalConfig {
   db?: any;
   /** 关联的报告 ID */
   reportId?: number;
+  /** KV 缓存引用 (P3.4: 动态采样率) */
+  kvCache?: KVNamespace | null;
 }
 
 export interface EvalScore {
@@ -86,6 +88,8 @@ export interface AgentEvalResult {
   evalLatencyMs: number;
   /** 是否跳过 (抽样未命中) */
   skipped: boolean;
+  /** P3.1: 是否触发低分告警 */
+  alertTriggered?: boolean;
 }
 
 export interface ReportEvalResult {
@@ -117,6 +121,17 @@ export class OpenEvalsEvaluator {
   private judgeFailCount = 0;
   /** 是否已降级到 fallback 模型 */
   private degraded = false;
+  /** P3.2: 令牌消耗追踪 */
+  private tokenUsage = {
+    totalCalls: 0,
+    successCalls: 0,
+    failedCalls: 0,
+    estimatedInputTokens: 0,
+    estimatedOutputTokens: 0,
+    totalLatencyMs: 0,
+  };
+  /** KV 缓存引用 (P3.4: 动态配置) */
+  private kvCache: KVNamespace | null = null;
 
   constructor(
     llmCall: LLMCallFn,
@@ -125,6 +140,7 @@ export class OpenEvalsEvaluator {
   ) {
     this.llmCall = llmCall;
     this.langfuseTrace = langfuseTrace;
+    this.kvCache = config?.kvCache || null;
     this.config = {
       enabled: config?.enabled !== false,
       mode: config?.mode || 'sampling',
@@ -140,7 +156,30 @@ export class OpenEvalsEvaluator {
       fallbackJudgeModel: config?.fallbackJudgeModel || 'gpt-4.1-mini',
       db: config?.db || null,
       reportId: config?.reportId ?? 0,
+      kvCache: config?.kvCache || null,
     };
+  }
+
+  /**
+   * P3.4: 从 KV 加载动态配置 (采样率、模式)
+   * 在首次 evaluateAgent 调用时触发
+   */
+  async loadDynamicConfig(): Promise<void> {
+    if (!this.kvCache) return;
+    try {
+      const rate = await this.kvCache.get('eval:samplingRate');
+      if (rate !== null) {
+        this.config.samplingRate = Math.max(0, Math.min(1, parseFloat(rate)));
+        console.log(`[OpenEvals] P3.4 动态采样率: ${this.config.samplingRate}`);
+      }
+      const mode = await this.kvCache.get('eval:mode');
+      if (mode && ['sampling', 'full', 'off'].includes(mode)) {
+        this.config.mode = mode as 'sampling' | 'full' | 'off';
+        console.log(`[OpenEvals] P3.4 动态模式: ${this.config.mode}`);
+      }
+    } catch (err) {
+      console.warn('[OpenEvals] P3.4 读取动态配置失败:', err);
+    }
   }
 
   /**
@@ -204,8 +243,14 @@ export class OpenEvalsEvaluator {
       .replace('{outputs}', outputs);
 
     await this.acquireSlot();
+    const callStart = Date.now();
     try {
       const model = this.getCurrentJudgeModel();
+      // P3.2: 估算输入 token (粗略: 1 中文字 ≈ 2 tokens, 1 英文词 ≈ 1.3 tokens)
+      const estimatedInputTokens = Math.ceil(filledPrompt.length * 0.7);
+      this.tokenUsage.totalCalls++;
+      this.tokenUsage.estimatedInputTokens += estimatedInputTokens;
+
       const response = await this.withTimeout(
         this.llmCall(
           '你是专业的财务分析质量评审专家。请严格按照JSON格式返回评估结果。',
@@ -216,6 +261,11 @@ export class OpenEvalsEvaluator {
         `Judge(${model})`,
       );
 
+      // P3.2: 记录成功调用 + 估算输出 token
+      this.tokenUsage.successCalls++;
+      this.tokenUsage.estimatedOutputTokens += Math.ceil(response.length * 0.7);
+      this.tokenUsage.totalLatencyMs += Date.now() - callStart;
+
       // 成功：重置失败计数
       if (this.degraded) {
         // 降级模型成功，保持降级
@@ -225,6 +275,8 @@ export class OpenEvalsEvaluator {
       return this.parseJudgeResponse(response);
     } catch (error) {
       this.judgeFailCount++;
+      this.tokenUsage.failedCalls++;
+      this.tokenUsage.totalLatencyMs += Date.now() - callStart;
       const currentModel = this.getCurrentJudgeModel();
       console.error(`[OpenEvals] Judge(${currentModel}) 调用失败 (第${this.judgeFailCount}次):`, error);
 
@@ -313,6 +365,11 @@ export class OpenEvalsEvaluator {
     agentOutput: string,
   ): Promise<AgentEvalResult> {
     const startTime = Date.now();
+
+    // P3.4: 首次调用时加载动态配置
+    if (this.agentResults.length === 0) {
+      await this.loadDynamicConfig();
+    }
 
     // 抽样检查
     if (!this.shouldEvaluate()) {
@@ -406,6 +463,12 @@ export class OpenEvalsEvaluator {
     // 记录评分到 Langfuse
     this.recordToLangfuse(agentType, scores, weightedTotal);
 
+    // P3.1: 低分告警检测
+    const alertTriggered = weightedTotal < 0.5 && weightedTotal >= 0;
+    if (alertTriggered) {
+      this.triggerLowScoreAlert(agentType, weightedTotal, scores);
+    }
+
     // P2.4: 持久化评分到 D1
     await this.persistToD1(agentType, scores, weightedTotal, evalLatencyMs);
 
@@ -413,9 +476,10 @@ export class OpenEvalsEvaluator {
       agentType,
       scores,
       weightedTotal,
-      judgeModel: this.config.judgeModel,
+      judgeModel: this.getCurrentJudgeModel(),
       evalLatencyMs,
       skipped: false,
+      alertTriggered,
     };
     this.agentResults.push(result);
     return result;
@@ -518,6 +582,62 @@ export class OpenEvalsEvaluator {
   }
 
   /**
+   * P3.1: 低分告警 — 加权分 <0.5 时记录到 Langfuse + D1
+   */
+  private triggerLowScoreAlert(
+    agentType: string,
+    weightedTotal: number,
+    scores: AgentEvalResult['scores'],
+  ): void {
+    const lowDims = Object.entries(scores)
+      .filter(([, v]) => v && v.score >= 0 && v.score < 0.5)
+      .map(([k, v]) => `${k}=${v!.score.toFixed(2)}`)
+      .join(', ');
+
+    const alertMsg = `⚠️ 低分告警: Agent ${agentType} 综合分=${weightedTotal.toFixed(2)}${lowDims ? ` [低分维度: ${lowDims}]` : ''}`;
+    console.warn(`[OpenEvals] ${alertMsg}`);
+
+    // 记录到 Langfuse (带 alert tag)
+    if (this.langfuseTrace) {
+      recordScore(this.langfuseTrace, {
+        name: `alert-low-score-${agentType}`,
+        value: weightedTotal,
+        comment: alertMsg,
+      });
+    }
+
+    // 写入 D1 告警表
+    this.persistAlert(agentType, weightedTotal, alertMsg).catch(err => {
+      console.error('[OpenEvals] 告警持久化失败:', err);
+    });
+  }
+
+  /**
+   * P3.1: 写入告警到 D1 eval_alerts 表
+   */
+  private async persistAlert(
+    agentType: string,
+    score: number,
+    message: string,
+  ): Promise<void> {
+    const db = this.config.db;
+    const reportId = this.config.reportId;
+    if (!db || !reportId) return;
+
+    try {
+      await db.prepare(
+        `INSERT INTO eval_alerts (report_id, agent_type, score, message, judge_model, degraded)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(
+        reportId, agentType, score, message,
+        this.getCurrentJudgeModel(), this.degraded ? 1 : 0,
+      ).run();
+    } catch (error) {
+      console.error('[OpenEvals] eval_alerts 写入失败:', error);
+    }
+  }
+
+  /**
    * P2.4: 将评分持久化到 D1 analysis_eval_scores 表
    */
   private async persistToD1(
@@ -615,8 +735,50 @@ export class OpenEvalsEvaluator {
       lines.push(`  ${r.agentType}: 综合=${r.weightedTotal.toFixed(2)} [${dims}] (${r.evalLatencyMs}ms)`);
     }
 
+    // P3.2: 令牌消耗信息
+    lines.push(`令牌消耗: ≈${this.tokenUsage.estimatedInputTokens} input + ≈${this.tokenUsage.estimatedOutputTokens} output`);
+    lines.push(`Judge 调用: ${this.tokenUsage.successCalls} 成功 / ${this.tokenUsage.failedCalls} 失败 / ${this.tokenUsage.totalCalls} 总计`);
+
     lines.push(`=========================================\n`);
     return lines.join('\n');
+  }
+
+  /**
+   * P3.2: 将令牌消耗持久化到 D1
+   * 在所有 Agent 评估完成后调用
+   */
+  async persistTokenUsage(): Promise<void> {
+    const db = this.config.db;
+    const reportId = this.config.reportId;
+    if (!db || !reportId) return;
+
+    try {
+      await db.prepare(
+        `INSERT INTO eval_token_usage (report_id, judge_model, total_calls, success_calls, failed_calls,
+         estimated_input_tokens, estimated_output_tokens, total_latency_ms, degraded)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(
+        reportId,
+        this.getCurrentJudgeModel(),
+        this.tokenUsage.totalCalls,
+        this.tokenUsage.successCalls,
+        this.tokenUsage.failedCalls,
+        this.tokenUsage.estimatedInputTokens,
+        this.tokenUsage.estimatedOutputTokens,
+        this.tokenUsage.totalLatencyMs,
+        this.degraded ? 1 : 0,
+      ).run();
+      console.log(`[OpenEvals] P3.2 令牌消耗已持久化 (report=${reportId})`);
+    } catch (err) {
+      console.error('[OpenEvals] P3.2 令牌消耗持久化失败:', err);
+    }
+  }
+
+  /**
+   * P3.2: 获取当前令牌消耗统计
+   */
+  getTokenUsage() {
+    return { ...this.tokenUsage };
   }
 }
 
@@ -635,4 +797,108 @@ export function createOpenEvalsEvaluator(
   config?: EvalConfig,
 ): OpenEvalsEvaluator {
   return new OpenEvalsEvaluator(llmCall, langfuseTrace, config);
+}
+
+// ============ P3.3: 评分查询 API 辅助函数 ============
+
+/**
+ * 查询单个报告的评分数据 (雷达图)
+ */
+export async function getReportEvalScores(db: any, reportId: number) {
+  try {
+    const { results } = await db.prepare(
+      `SELECT agent_type, dimension, score, reasoning, judge_model, eval_latency_ms, degraded, created_at
+       FROM analysis_eval_scores
+       WHERE report_id = ?
+       ORDER BY agent_type, dimension`
+    ).bind(reportId).all();
+    return results || [];
+  } catch { return []; }
+}
+
+/**
+ * 查询评分趋势 (最近 N 个报告的加权综合分)
+ */
+export async function getEvalScoreTrend(db: any, limit = 50) {
+  try {
+    const { results } = await db.prepare(
+      `SELECT report_id, agent_type, score, judge_model, degraded, created_at
+       FROM analysis_eval_scores
+       WHERE dimension = 'weighted_total'
+       ORDER BY created_at DESC
+       LIMIT ?`
+    ).bind(limit).all();
+    return results || [];
+  } catch { return []; }
+}
+
+/**
+ * 查询维度聚合统计 (各维度平均分)
+ */
+export async function getEvalDimensionStats(db: any) {
+  try {
+    const { results } = await db.prepare(
+      `SELECT dimension, 
+              COUNT(*) as count,
+              ROUND(AVG(score), 3) as avg_score,
+              ROUND(MIN(score), 3) as min_score,
+              ROUND(MAX(score), 3) as max_score,
+              SUM(CASE WHEN score < 0.5 THEN 1 ELSE 0 END) as low_count
+       FROM analysis_eval_scores
+       WHERE dimension != 'weighted_total' AND score >= 0
+       GROUP BY dimension
+       ORDER BY avg_score ASC`
+    ).all();
+    return results || [];
+  } catch { return []; }
+}
+
+/**
+ * 查询告警列表
+ */
+export async function getEvalAlerts(db: any, limit = 30) {
+  try {
+    const { results } = await db.prepare(
+      `SELECT id, report_id, agent_type, score, message, judge_model, degraded, created_at
+       FROM eval_alerts
+       ORDER BY created_at DESC
+       LIMIT ?`
+    ).bind(limit).all();
+    return results || [];
+  } catch { return []; }
+}
+
+/**
+ * 查询降级率统计
+ */
+export async function getEvalDegradationStats(db: any) {
+  try {
+    const { results } = await db.prepare(
+      `SELECT 
+         COUNT(*) as total,
+         SUM(CASE WHEN degraded = 1 THEN 1 ELSE 0 END) as degraded_count,
+         ROUND(AVG(eval_latency_ms), 0) as avg_latency_ms,
+         ROUND(AVG(CASE WHEN degraded = 0 THEN score END), 3) as avg_score_primary,
+         ROUND(AVG(CASE WHEN degraded = 1 THEN score END), 3) as avg_score_fallback
+       FROM analysis_eval_scores
+       WHERE dimension = 'weighted_total'`
+    ).all();
+    return results?.[0] || {};
+  } catch { return {}; }
+}
+
+/**
+ * P3.2: 查询令牌消耗汇总
+ */
+export async function getEvalTokenUsage(db: any, limit = 50) {
+  try {
+    const { results } = await db.prepare(
+      `SELECT report_id, judge_model, total_calls, success_calls, failed_calls,
+              estimated_input_tokens, estimated_output_tokens, total_latency_ms, degraded, created_at
+       FROM eval_token_usage
+       ORDER BY created_at DESC
+       LIMIT ?`
+    ).bind(limit).all();
+    return results || [];
+  } catch { return []; }
 }

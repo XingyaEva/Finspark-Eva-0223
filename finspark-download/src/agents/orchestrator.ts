@@ -511,6 +511,9 @@ ${trimmedUserPrompt}
         // 输出评估摘要
         console.log(this.evaluator.getSummary());
 
+        // P3.2: 持久化令牌消耗
+        await this.evaluator.persistTokenUsage();
+
         // 记录整体评估分到 Langfuse
         const evalReport = this.evaluator.getReportEvalResult();
         recordScore(this.langfuseTrace, {

@@ -764,6 +764,7 @@ api.post('/analyze/start', optionalAuthMiddleware(), async (c) => {
         enableCrossConsistency: false, // P2.1: 默认关闭 Layer3 节省 CPU
         db: db || undefined,          // P2.4: D1 持久化
         reportId,                     // P2.4: 关联报告 ID
+        kvCache: cache || undefined,  // P3.4: 动态采样率
       } : undefined,
       onProgress: async (progress) => {
         // 实时更新进度到 KV/D1
@@ -1299,6 +1300,7 @@ api.post('/analyze/force-reanalyze', optionalAuthMiddleware(), async (c) => {
         enableCrossConsistency: true,  // force-reanalyze 保留 Layer3
         db: db || undefined,          // P2.4: D1 持久化
         reportId,                     // P2.4: 关联报告 ID
+        kvCache: cache || undefined,  // P3.4: 动态采样率
       } : undefined,
       onProgress: async (progress) => {
         if (currentReportsService) {
