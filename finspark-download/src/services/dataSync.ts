@@ -27,7 +27,7 @@ export class DataSyncService {
   
   constructor(db: D1Database, tushareToken: string, cache?: KVNamespace) {
     this.db = db;
-    this.tushare = createTushareService(tushareToken, cache, true);
+    this.tushare = createTushareService({ token: tushareToken, cache, useProxy: true });
   }
   
   /**

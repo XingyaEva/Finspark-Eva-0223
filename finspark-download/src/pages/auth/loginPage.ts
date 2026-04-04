@@ -66,7 +66,7 @@ const loginFormHtml = `
     </div>
 
     <!-- 登录按钮 -->
-    <button type="submit" class="auth-submit-btn" id="loginBtn">
+    <button type="submit" class="auth-submit-btn" id="loginBtn" aria-label="登录">
       <span class="btn-text">登录</span>
       <span class="btn-loading">
         <span class="auth-spinner"></span>
@@ -84,11 +84,11 @@ const loginFormHtml = `
 
   <!-- 社交登录 -->
   <div class="auth-social-row">
-    <button class="auth-social-btn" onclick="alert('Google 登录功能即将上线')">
+    <button class="auth-social-btn" onclick="alert('Google 登录功能即将上线')" aria-label="Google 登录">
       ${icons.google}
       Google
     </button>
-    <button class="auth-social-btn" onclick="alert('GitHub 登录功能即将上线')">
+    <button class="auth-social-btn" onclick="alert('GitHub 登录功能即将上线')" aria-label="GitHub 登录">
       ${icons.github}
       GitHub
     </button>

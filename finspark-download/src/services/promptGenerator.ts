@@ -8,7 +8,7 @@
  * - 人格修饰词应用
  */
 
-import { ANALYSIS_PERSONALITIES, applyPersonalityToPrompt } from './analysisPersonality';
+import { ANALYSIS_PERSONALITIES, applyPersonalityToPrompt, type PersonalityId } from './analysisPersonality';
 
 // Prompt 分段标记
 export const PROMPT_BOUNDARIES = {
@@ -209,7 +209,7 @@ export function assemblePrompt(options: PromptAssemblyOptions): AssembledPrompt 
   // 2.3 应用人格修饰词
   let personalityApplied: string | null = null;
   if (personalityId && agentType === 'FINAL_CONCLUSION') {
-    const modifier = applyPersonalityToPrompt(agentType, '', personalityId);
+    const modifier = applyPersonalityToPrompt('', personalityId as PersonalityId, agentType);
     if (modifier) {
       userParts.push('');
       userParts.push('--- 分析风格要求 ---');

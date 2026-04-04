@@ -57,7 +57,7 @@ preferences.patch('/', authMiddleware(), async (c) => {
     
     // 验证更新字段
     const allowedFields = [
-      'defaultReportType', 'analysisDepth', 'includeComic', 'includeForecast', 
+      'defaultReportType', 'analysisDepth', 'analysisStyle', 'includeComic', 'includeForecast', 
       'includeIndustryCompare', 'theme', 'language', 'chartColorScheme',
       'emailNotifications', 'reportCompleteNotify', 'weeklyDigest', 'marketingEmails',
       'favoriteStocks', 'recentSearches', 'pinnedReports', 'exportFormat'

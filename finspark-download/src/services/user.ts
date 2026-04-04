@@ -1207,10 +1207,10 @@ export class UserService {
       `).bind(userId, sessionId).run();
       
       // 记录转化活动
-      await this.logActivity(userId, sessionId, 'guest_converted', 'migration', JSON.stringify({
+      await this.logActivity(userId, sessionId, 'guest_converted', 'migration', {
         migratedReports: reportsToMigrate,
         migratedLogs: logsToMigrate
-      }));
+      } as any);
       
       const messages = [];
       if (reportsToMigrate > 0) {

@@ -692,10 +692,20 @@ export const heroSearchScript = `
       }
     }
     let configParams = '';
+    // 传递 Preset 覆盖参数
     if (typeof getAnalysisPresetOverrides === 'function') {
       const overrides = getAnalysisPresetOverrides();
       if (overrides && overrides.globalPresetId) configParams = '&presetId=' + overrides.globalPresetId;
       if (overrides && overrides.globalModelPreference) configParams += '&model=' + overrides.globalModelPreference;
+    }
+    // 传递用户分析偏好参数（深度、风格、模块开关）
+    if (typeof getAnalysisUserPreferences === 'function') {
+      const prefs = getAnalysisUserPreferences();
+      if (prefs.analysisDepth) configParams += '&depth=' + prefs.analysisDepth;
+      if (prefs.analysisStyle) configParams += '&style=' + prefs.analysisStyle;
+      if (!prefs.includeForecast) configParams += '&forecast=0';
+      if (!prefs.includeIndustryCompare) configParams += '&industryCompare=0';
+      if (!prefs.includeComic) configParams += '&comic=0';
     }
     window.location.href = '/analysis?code=' + selectedStock.code + '&name=' + encodeURIComponent(selectedStock.name) + configParams;
   }

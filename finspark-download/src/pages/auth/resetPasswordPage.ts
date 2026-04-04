@@ -68,7 +68,7 @@ const resetPasswordFormHtml = `
     </div>
 
     <!-- 提交按钮 -->
-    <button type="submit" class="auth-submit-btn" id="resetBtn" style="margin-top: 8px;">
+    <button type="submit" class="auth-submit-btn" id="resetBtn" style="margin-top: 8px;" aria-label="重置密码">
       <span class="btn-text">重置密码</span>
       <span class="btn-loading">
         <span class="auth-spinner"></span>

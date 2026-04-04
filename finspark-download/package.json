@@ -3,16 +3,17 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:sandbox": "wrangler pages dev dist --d1=genspark-financial-db --ip 0.0.0.0 --port 3000",
+    "dev:sandbox": "npm run build && wrangler pages dev dist --d1=genspark-financial-db --ip 0.0.0.0 --port 3000",
     "dev:init": "npm run db:init && npm run dev:sandbox",
     "start": "npm run build && npm run db:init && npm run dev:sandbox",
     "build": "vite build",
+    "build:check": "vite build && echo '\n[build:check] dist/_worker.js size:' && stat -c%s dist/_worker.js 2>/dev/null || stat -f%z dist/_worker.js",
     "preview": "wrangler pages dev --d1=genspark-financial-db",
     "deploy": "npm run build && wrangler pages deploy dist",
     "deploy:prod": "npm run build && wrangler pages deploy dist --project-name finspark-financial",
     "cf-typegen": "wrangler types --env-interface CloudflareBindings",
+    "dev:watch": "bash scripts/dev-watch.sh --port 3001",
     "clean-port": "fuser -k 3000/tcp 2>/dev/null || true",
-    
     "db:init": "node scripts/db-init.mjs",
     "db:init:full": "node scripts/db-init.mjs --full --skip-sync",
     "db:init:sync": "node scripts/db-init.mjs --full --sync-all",
@@ -28,7 +29,6 @@
     "db:console": "wrangler d1 execute genspark-financial-db --local",
     "db:status": "wrangler d1 execute genspark-financial-db --local --command='SELECT COUNT(*) as count FROM stocks;'",
     "db:tables": "wrangler d1 execute genspark-financial-db --local --command=\"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;\"",
-    
     "sync:stocks": "node scripts/sync_all_stocks.mjs",
     "sync:stocks:a": "node scripts/sync_all_stocks.mjs --a-stock --full --hot",
     "sync:stocks:hk": "node scripts/sync_hk_stocks.mjs --full --hot",
@@ -42,7 +42,9 @@
   },
   "dependencies": {
     "exceljs": "^4.4.0",
-    "hono": "^4.11.0"
+    "fflate": "^0.8.2",
+    "hono": "^4.11.0",
+    "langfuse": "^3.38.20"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20251213.0",
@@ -51,6 +53,7 @@
     "http-proxy": "^1.18.1",
     "typescript": "^5.9.3",
     "vite": "^6.3.5",
+    "vitest": "^4.1.2",
     "wrangler": "^4.4.0",
     "xlsx": "^0.18.5"
   }

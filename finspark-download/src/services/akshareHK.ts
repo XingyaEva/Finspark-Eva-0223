@@ -82,7 +82,7 @@ interface AkshareRawItem {
  * 港股中文项目名 → Tushare A股字段名
  * 数据来源: AKShare stock_financial_hk_report_em (东方财富)
  */
-const INCOME_FIELD_MAP: Record<string, keyof IncomeData> = {
+const INCOME_FIELD_MAP: Record<string, string> = {
   // 核心收入指标
   '营业额': 'total_revenue',
   '收入': 'revenue',
@@ -138,7 +138,7 @@ const INCOME_FIELD_MAP: Record<string, keyof IncomeData> = {
  * 港股资产负债表字段映射
  * 数据来源: AKShare stock_financial_hk_report_em (东方财富)
  */
-const BALANCE_FIELD_MAP: Record<string, keyof BalanceData> = {
+const BALANCE_FIELD_MAP: Record<string, string> = {
   // 资产总计
   '总资产': 'total_assets',
   '资产总计': 'total_assets',
@@ -244,7 +244,7 @@ const BALANCE_FIELD_MAP: Record<string, keyof BalanceData> = {
  * 港股现金流量表字段映射
  * 数据来源: AKShare stock_financial_hk_report_em (东方财富)
  */
-const CASHFLOW_FIELD_MAP: Record<string, keyof CashFlowData> = {
+const CASHFLOW_FIELD_MAP: Record<string, string> = {
   // 经营活动
   '经营活动产生的现金流量净额': 'n_cashflow_act',
   '经营产生现金': 'n_cashflow_act',

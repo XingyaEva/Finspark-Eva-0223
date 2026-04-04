@@ -838,6 +838,9 @@ export interface DailyBasicData {
   ts_code: string;
   trade_date: string;
   close: number;
+  pct_chg?: number;
+  vol?: number;
+  amount?: number;
   turnover_rate: number;
   volume_ratio: number;
   pe: number;

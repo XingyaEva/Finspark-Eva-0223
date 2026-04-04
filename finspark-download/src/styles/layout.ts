@@ -319,6 +319,130 @@ export const layoutStyles = `
   }
 
   /* ============================================
+   * 侧边栏折叠按钮
+   * ============================================ */
+  .sidebar-collapse-toggle {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+    z-index: 5;
+    border: 1px solid transparent;
+    font-size: 12px;
+  }
+  .sidebar-collapse-toggle:hover {
+    background: rgba(212, 175, 55, 0.12);
+    color: var(--gold-primary);
+    border-color: var(--border-gold);
+  }
+
+  /* ============================================
+   * 侧边栏折叠状态
+   * ============================================ */
+  .app-sidebar.collapsed {
+    width: var(--sidebar-collapsed-width);
+  }
+  .app-sidebar.collapsed .sidebar-collapse-toggle {
+    right: 50%;
+    transform: translateX(50%);
+    top: 8px;
+  }
+  .app-sidebar.collapsed .sidebar-nav {
+    padding: var(--space-md) 6px;
+  }
+  .app-sidebar.collapsed .sidebar-section-label {
+    opacity: 0;
+    height: 0;
+    padding: 0;
+    margin: 0;
+    overflow: hidden;
+    transition: all var(--transition-fast);
+  }
+  .app-sidebar.collapsed .sidebar-item {
+    justify-content: center;
+    padding: 10px 0;
+    margin: 2px 4px;
+    position: relative;
+  }
+  .app-sidebar.collapsed .sidebar-item i {
+    width: auto;
+    font-size: 17px;
+  }
+  .app-sidebar.collapsed .sidebar-item .sidebar-item-label {
+    position: absolute;
+    width: 0;
+    height: 0;
+    opacity: 0;
+    overflow: hidden;
+    pointer-events: none;
+  }
+  .app-sidebar.collapsed .sidebar-item .badge {
+    position: absolute;
+    width: 0;
+    height: 0;
+    opacity: 0;
+    overflow: hidden;
+    pointer-events: none;
+  }
+  .app-sidebar.collapsed .sidebar-item.active::before {
+    top: 8px;
+    bottom: 8px;
+  }
+
+  /* 折叠状态 tooltip (hover 显示) */
+  .app-sidebar.collapsed .sidebar-item::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    left: calc(100% + 8px);
+    top: 50%;
+    transform: translateY(-50%);
+    padding: 6px 12px;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-size: 13px;
+    font-weight: 500;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-gold);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    white-space: nowrap;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.15s ease, visibility 0.15s ease;
+    z-index: 50;
+    pointer-events: none;
+  }
+  .app-sidebar.collapsed .sidebar-item:hover::after {
+    opacity: 1;
+    visibility: visible;
+  }
+
+  /* 折叠状态底部用户区 */
+  .app-sidebar.collapsed .sidebar-footer {
+    padding: var(--space-sm) 6px;
+  }
+  .app-sidebar.collapsed .sidebar-user {
+    justify-content: center;
+    padding: var(--space-sm) 0;
+  }
+  .app-sidebar.collapsed .sidebar-user-info {
+    position: absolute;
+    width: 0;
+    height: 0;
+    opacity: 0;
+    overflow: hidden;
+    pointer-events: none;
+  }
+
+  /* ============================================
    * 主内容区
    * ============================================ */
   .app-main {
@@ -328,6 +452,10 @@ export const layoutStyles = `
     min-height: calc(100vh - var(--topbar-height));
     padding: var(--space-lg);
     overflow-x: hidden;
+    transition: margin-left var(--transition-normal);
+  }
+  .app-main.sidebar-collapsed {
+    margin-left: var(--sidebar-collapsed-width);
   }
 
   .app-main-inner {
@@ -379,9 +507,17 @@ export const layoutStyles = `
       display: flex;
     }
 
+    .sidebar-collapse-toggle {
+      display: none;
+    }
+
     .app-sidebar {
       transform: translateX(-100%);
       box-shadow: none;
+      width: var(--sidebar-width);
+    }
+    .app-sidebar.collapsed {
+      width: var(--sidebar-width);
     }
     .app-sidebar.open {
       transform: translateX(0);
@@ -389,6 +525,9 @@ export const layoutStyles = `
     }
 
     .app-main {
+      margin-left: 0;
+    }
+    .app-main.sidebar-collapsed {
       margin-left: 0;
     }
 

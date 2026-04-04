@@ -90,14 +90,14 @@ export function wrapWithMainLayout(options: MainLayoutOptions): string {
 
   <!-- 用户下拉菜单 (在 body 层以避免 overflow 裁剪) -->
   <div class="topbar-user-dropdown" id="topbarUserDropdown">
+    <a class="topbar-user-dropdown-item" href="/account">
+      <i class="fas fa-user-circle"></i> 个人中心
+    </a>
     <a class="topbar-user-dropdown-item" href="/settings">
       <i class="fas fa-cog"></i> 设置
     </a>
     <a class="topbar-user-dropdown-item" href="/membership">
       <i class="fas fa-crown"></i> 会员中心
-    </a>
-    <a class="topbar-user-dropdown-item" href="/account">
-      <i class="fas fa-user-circle"></i> 账号管理
     </a>
     <div class="topbar-user-dropdown-divider"></div>
     <a class="topbar-user-dropdown-item" href="#" onclick="logoutFromApp(); return false;" style="color: var(--color-danger);">
@@ -167,6 +167,10 @@ export function wrapWithMainLayout(options: MainLayoutOptions): string {
     // 初始化
     document.addEventListener('DOMContentLoaded', () => {
       checkLayoutAuth();
+      // 恢复侧边栏折叠状态
+      if (typeof initSidebarCollapse === 'function') {
+        initSidebarCollapse();
+      }
     });
 
     // ---- 页面专属脚本 ----

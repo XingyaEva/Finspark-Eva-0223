@@ -1341,7 +1341,7 @@ Must include visible text: "AI生成，仅供参考" (AI-generated, for referenc
 === OUTPUT ===
 Style: Modern, clean, professional infographic
 Resolution: 4K quality
-Color scheme: ${theme?.colorScheme || 'Professional gradient'}
+Color scheme: ${(theme as any)?.colorScheme || 'Professional gradient'}
 `;
 
   return prompt;

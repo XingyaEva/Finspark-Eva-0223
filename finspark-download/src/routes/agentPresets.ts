@@ -434,8 +434,8 @@ agentPresets.patch('/settings/:agentType', authMiddleware(), requireDB, async (c
 agentPresets.get('/official/list', async (c) => {
   const activeAgents = getActiveAgentTypes();
   const presets = activeAgents.map(agentType => ({
-    agentType,
     ...OFFICIAL_PRESETS[agentType],
+    agentType,
   }));
 
   return c.json({

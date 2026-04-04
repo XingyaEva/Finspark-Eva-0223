@@ -68,6 +68,68 @@ export const homeNavbarStyles = `
     color: rgba(255, 255, 255, 0.95);
   }
 
+  /* 锁定的导航项（即将推出） */
+  .home-nav-links .nav-locked,
+  .home-mobile-link.nav-locked {
+    color: rgba(255, 255, 255, 0.3) !important;
+    cursor: not-allowed !important;
+    pointer-events: auto;
+    position: relative;
+    user-select: none;
+  }
+  .home-nav-links .nav-locked:hover {
+    color: rgba(255, 255, 255, 0.3) !important;
+  }
+  .home-nav-links .nav-locked .nav-lock-icon {
+    display: inline-block;
+    margin-left: 4px;
+    font-size: 11px;
+    opacity: 0.7;
+    vertical-align: middle;
+  }
+  .home-mobile-link.nav-locked .nav-lock-icon {
+    display: inline-block;
+    margin-left: 4px;
+    font-size: 11px;
+    opacity: 0.7;
+  }
+  /* 悬浮提示气泡 */
+  .home-nav-links .nav-locked .nav-locked-tooltip {
+    display: none;
+    position: absolute;
+    top: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #1e2432;
+    color: rgba(255, 255, 255, 0.75);
+    font-size: 12px;
+    padding: 6px 14px;
+    border-radius: 6px;
+    white-space: nowrap;
+    border: 1px solid rgba(212, 175, 55, 0.2);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+    pointer-events: none;
+    z-index: 60;
+  }
+  .home-nav-links .nav-locked .nav-locked-tooltip::before {
+    content: '';
+    position: absolute;
+    top: -5px;
+    left: 50%;
+    transform: translateX(-50%);
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-bottom: 5px solid #1e2432;
+  }
+  .home-nav-links .nav-locked:hover .nav-locked-tooltip {
+    display: block;
+  }
+  .home-mobile-link.nav-locked:hover,
+  .home-mobile-link.nav-locked:active {
+    background: transparent !important;
+    color: rgba(255, 255, 255, 0.3) !important;
+  }
+
   /* 右侧按钮区 */
   .home-nav-right {
     display: flex;
@@ -308,7 +370,7 @@ export function generateHomeNavbar(): string {
 
     <div class="home-nav-links">
       <a href="/">首页</a>
-      <a href="/analysis">市场分析</a>
+      <span class="nav-locked" onclick="event.preventDefault();">市场分析<i class="fas fa-lock nav-lock-icon"></i><span class="nav-locked-tooltip">🔒 即将推出</span></span>
       <a href="/my-reports">AI研报</a>
       <a href="/membership">关于我们</a>
     </div>
@@ -337,10 +399,13 @@ export function generateHomeNavbar(): string {
         <div class="home-nav-user-avatar" id="homeUserAvatar"><i class="fas fa-user" style="font-size:14px"></i></div>
         <span class="home-nav-user-name" id="homeUserName"></span>
         <div class="home-user-dropdown" id="homeUserDropdown">
+          <a href="/account"><i class="fas fa-user-circle gold-text"></i>个人中心</a>
           <a href="/my-reports"><i class="fas fa-file-alt gold-text"></i>我的报告</a>
           <a href="/favorites"><i class="fas fa-heart gold-text"></i>我的收藏</a>
+          <div class="divider"></div>
           <a href="/settings/agents"><i class="fas fa-robot gold-text"></i>Agent 配置</a>
-          <a href="/settings"><i class="fas fa-cog gold-text"></i>账号设置</a>
+          <a href="/settings"><i class="fas fa-cog gold-text"></i>设置</a>
+          <a href="/membership"><i class="fas fa-crown gold-text"></i>会员中心</a>
           <div class="divider"></div>
           <button onclick="logout()" style="color:#EF4444;"><i class="fas fa-sign-out-alt"></i>退出登录</button>
         </div>
@@ -379,12 +444,13 @@ export function generateHomeNavbar(): string {
       </div>
     </div>
     <a href="/" class="home-mobile-link" onclick="closeHomeMobileMenu()"><i class="fas fa-home"></i>首页</a>
-    <a href="/analysis" class="home-mobile-link" onclick="closeHomeMobileMenu()"><i class="fas fa-chart-bar"></i>市场分析</a>
+    <span class="home-mobile-link nav-locked" onclick="event.preventDefault();event.stopPropagation();"><i class="fas fa-lock" style="opacity:0.5"></i>市场分析<span class="nav-lock-icon" style="font-size:11px;opacity:0.5;margin-left:4px;">即将推出</span></span>
     <a href="/my-reports" class="home-mobile-link" onclick="closeHomeMobileMenu()"><i class="fas fa-file-alt"></i>AI研报</a>
     <a href="/favorites" class="home-mobile-link" onclick="closeHomeMobileMenu()"><i class="fas fa-heart"></i>我的收藏</a>
     <div class="home-mobile-divider"></div>
+    <a href="/account" class="home-mobile-link" onclick="closeHomeMobileMenu()"><i class="fas fa-user-circle"></i>个人中心</a>
     <a href="/settings/agents" class="home-mobile-link" onclick="closeHomeMobileMenu()"><i class="fas fa-robot"></i>Agent 配置</a>
-    <a href="/settings" class="home-mobile-link" onclick="closeHomeMobileMenu()"><i class="fas fa-cog"></i>账号设置</a>
+    <a href="/settings" class="home-mobile-link" onclick="closeHomeMobileMenu()"><i class="fas fa-cog"></i>设置</a>
     <a href="/membership" class="home-mobile-link" onclick="closeHomeMobileMenu()"><i class="fas fa-crown"></i>会员中心</a>
     <div id="mobileLogoutSection" style="display:none;">
       <div class="home-mobile-divider"></div>

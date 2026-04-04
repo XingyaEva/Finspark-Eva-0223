@@ -448,7 +448,7 @@ export class ReportsService {
         company_code: r.company_code,
         company_name: r.company_name,
         report_type: r.report_type,
-        report_period: r.report_period,
+        report_period: r.report_period ?? undefined,
         status: r.status,
         created_at: r.created_at,
         score,
