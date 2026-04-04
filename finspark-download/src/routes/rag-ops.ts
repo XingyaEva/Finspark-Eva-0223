@@ -13,6 +13,8 @@
 import { Hono } from 'hono';
 import type { Bindings } from '../types';
 import { createConfigService } from '../services/ragConfig';
+import { createFTS5Service } from '../services/ragFts5';
+import { createEmbeddingConfig, generateEmbedding } from '../services/rag';
 
 const ragOps = new Hono<{ Bindings: Bindings }>();
 
@@ -314,6 +316,225 @@ ragOps.get('/system/storage-stats', async (c) => {
   } catch (error) {
     console.error('[RAG Ops] Get storage stats error:', error);
     return c.json({ success: false, error: '获取存储统计失败' }, 500);
+  }
+});
+
+// ==================== Vectorize 迁移工具 ====================
+
+/**
+ * POST /migrate-vectorize — 将历史 KV embedding 迁移到 Vectorize
+ *
+ * 扫描 rag_chunks 中 has_embedding=1 的记录，从 KV 读取 embedding，
+ * 批量 upsert 到 Vectorize。支持断点续传（通过 offset 参数）。
+ */
+ragOps.post('/migrate-vectorize', async (c) => {
+  try {
+    const env = c.env;
+    if (!env.VECTORIZE) {
+      return c.json({ success: false, error: 'Vectorize binding not configured' }, 400);
+    }
+
+    const body = await c.req.json().catch(() => ({})) as { batchSize?: number; offset?: number; limit?: number };
+    const batchSize = Math.min(body.batchSize || 500, 1000);
+    const offset = body.offset || 0;
+    const totalLimit = body.limit || 10000;  // 单次请求最多迁移 10000 条
+
+    // 获取待迁移的 chunks
+    const chunksResult = await env.DB.prepare(
+      `SELECT c.id, c.document_id, c.chunk_index, c.embedding_key,
+              d.stock_code, d.category
+       FROM rag_chunks c
+       JOIN rag_documents d ON d.id = c.document_id
+       WHERE c.has_embedding = 1 AND d.status = 'completed'
+       ORDER BY c.id
+       LIMIT ? OFFSET ?`
+    ).bind(totalLimit, offset).all();
+
+    const chunks = chunksResult.results || [];
+    if (chunks.length === 0) {
+      return c.json({ success: true, message: 'No chunks to migrate', migrated: 0, offset });
+    }
+
+    let migrated = 0;
+    let failed = 0;
+    const errors: Array<{ chunkId: number; error: string }> = [];
+
+    // 批量处理
+    for (let i = 0; i < chunks.length; i += batchSize) {
+      const batch = chunks.slice(i, i + batchSize);
+      const vectors: VectorizeVector[] = [];
+
+      for (const chunk of batch) {
+        try {
+          const embeddingStr = await env.CACHE.get(chunk.embedding_key as string);
+          if (!embeddingStr) {
+            failed++;
+            continue;
+          }
+          const embedding = JSON.parse(embeddingStr) as number[];
+          vectors.push({
+            id: `${chunk.document_id}:${chunk.chunk_index}`,
+            values: embedding,
+            metadata: {
+              document_id: chunk.document_id as number,
+              chunk_index: chunk.chunk_index as number,
+              stock_code: (chunk.stock_code as string) || '',
+              category: (chunk.category as string) || 'general',
+            },
+          });
+        } catch (e) {
+          failed++;
+          errors.push({ chunkId: chunk.id as number, error: String(e) });
+        }
+      }
+
+      if (vectors.length > 0) {
+        try {
+          await env.VECTORIZE.upsert(vectors);
+          migrated += vectors.length;
+        } catch (e) {
+          failed += vectors.length;
+          console.error(`[Migrate] Vectorize upsert batch failed:`, e);
+        }
+      }
+    }
+
+    return c.json({
+      success: true,
+      migrated,
+      failed,
+      total: chunks.length,
+      nextOffset: offset + chunks.length,
+      hasMore: chunks.length >= totalLimit,
+      errors: errors.slice(0, 10),  // 最多返回 10 个错误详情
+    });
+  } catch (error) {
+    console.error('[RAG Ops] Migrate vectorize error:', error);
+    return c.json({ success: false, error: '迁移失败' }, 500);
+  }
+});
+
+// ==================== FTS5 管理工具 ====================
+
+/**
+ * POST /rebuild-fts5 — 重建 FTS5 全文索引
+ */
+ragOps.post('/rebuild-fts5', async (c) => {
+  try {
+    const fts5Service = createFTS5Service(c.env.DB);
+    const result = await fts5Service.rebuildIndex();
+    return c.json({ success: true, ...result });
+  } catch (error) {
+    console.error('[RAG Ops] Rebuild FTS5 error:', error);
+    return c.json({ success: false, error: '重建 FTS5 索引失败' }, 500);
+  }
+});
+
+/**
+ * GET /fts5-stats — 获取 FTS5 索引统计
+ */
+ragOps.get('/fts5-stats', async (c) => {
+  try {
+    const fts5Service = createFTS5Service(c.env.DB);
+    const stats = await fts5Service.getStats();
+    return c.json({ success: true, ...stats });
+  } catch (error) {
+    console.error('[RAG Ops] FTS5 stats error:', error);
+    return c.json({ success: false, error: '获取 FTS5 统计失败' }, 500);
+  }
+});
+
+/**
+ * POST /optimize-fts5 — 优化 FTS5 索引（合并内部 b-tree 段）
+ */
+ragOps.post('/optimize-fts5', async (c) => {
+  try {
+    const fts5Service = createFTS5Service(c.env.DB);
+    await fts5Service.optimize();
+    return c.json({ success: true, message: 'FTS5 索引优化完成' });
+  } catch (error) {
+    console.error('[RAG Ops] Optimize FTS5 error:', error);
+    return c.json({ success: false, error: '优化 FTS5 索引失败' }, 500);
+  }
+});
+
+// ==================== 检索 A/B 对比 ====================
+
+/**
+ * GET /search-compare — 多通道检索结果对比
+ * 同时运行 FTS5 + BM25 对比（向量检索通过 searchSimilar 自动选择）
+ */
+ragOps.get('/search-compare', async (c) => {
+  try {
+    const query = c.req.query('q');
+    if (!query) return c.json({ success: false, error: 'Missing query parameter q' }, 400);
+
+    const topK = parseInt(c.req.query('topK') || '5');
+    const stockCode = c.req.query('stockCode') || undefined;
+    const env = c.env;
+
+    const results: Record<string, { latencyMs: number; count: number; topScore: number; results: any[] }> = {};
+
+    // FTS5 检索
+    try {
+      const fts5Service = createFTS5Service(env.DB);
+      const fts5Start = Date.now();
+      const fts5Results = await fts5Service.search(query, { topK, stockCode });
+      results.fts5 = {
+        latencyMs: Date.now() - fts5Start,
+        count: fts5Results.length,
+        topScore: fts5Results[0]?.score || 0,
+        results: fts5Results.map(r => ({
+          chunkId: r.chunkId,
+          documentId: r.documentId,
+          score: r.score,
+          snippet: r.snippet,
+        })),
+      };
+    } catch (e) {
+      results.fts5 = { latencyMs: 0, count: 0, topScore: 0, results: [{ error: String(e) }] };
+    }
+
+    // 旧 BM25 检索
+    try {
+      const { createBM25Service } = await import('../services/ragBm25');
+      const bm25Service = createBM25Service(env.DB);
+      const bm25Start = Date.now();
+      const bm25Results = await bm25Service.search(query, { topK, stockCode });
+      results.bm25 = {
+        latencyMs: Date.now() - bm25Start,
+        count: bm25Results.length,
+        topScore: bm25Results[0]?.score || 0,
+        results: bm25Results.map(r => ({
+          chunkId: r.chunkId,
+          documentId: r.documentId,
+          score: r.score,
+          matchedTokens: r.matchedTokens,
+        })),
+      };
+    } catch (e) {
+      results.bm25 = { latencyMs: 0, count: 0, topScore: 0, results: [{ error: String(e) }] };
+    }
+
+    // Vectorize 信息
+    if (env.VECTORIZE) {
+      try {
+        const info = await env.VECTORIZE.describe();
+        results.vectorize_info = {
+          latencyMs: 0,
+          count: 0,
+          topScore: 0,
+          results: [{ indexInfo: info }],
+        };
+      } catch (e) {
+        results.vectorize_info = { latencyMs: 0, count: 0, topScore: 0, results: [{ error: String(e) }] };
+      }
+    }
+
+    return c.json({ success: true, query, results });
+  } catch (error) {
+    console.error('[RAG Ops] Search compare error:', error);
+    return c.json({ success: false, error: '检索对比失败' }, 500);
   }
 });
 

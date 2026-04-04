@@ -487,8 +487,9 @@ export class RAGService {
   private apiKey: string;  // VectorEngine API Key (用于LLM Chat)
   private embeddingConfig: EmbeddingConfig;
   private bm25BuildCallback?: (documentId: number) => Promise<void>;
+  private vectorize?: Vectorize;  // Cloudflare Vectorize 向量数据库（可选，替代 KV 全扫）
   
-  constructor(db: D1Database, kv: KVNamespace, apiKey: string, embeddingConfig?: EmbeddingConfig) {
+  constructor(db: D1Database, kv: KVNamespace, apiKey: string, embeddingConfig?: EmbeddingConfig, vectorize?: Vectorize) {
     this.db = db;
     this.kv = kv;
     this.apiKey = apiKey;
@@ -497,6 +498,7 @@ export class RAGService {
       vectorengineApiKey: apiKey,
       preferredProvider: 'vectorengine',
     });
+    this.vectorize = vectorize;
   }
 
   /**
@@ -651,9 +653,29 @@ export class RAGService {
         if (statements.length > 0) {
           await this.db.batch(statements);
         }
+
+        // 4b. 同步写入 Vectorize（双写，如果 Vectorize 可用）
+        if (this.vectorize) {
+          try {
+            const vectors: VectorizeVector[] = batchItems.map((item, i) => ({
+              id: `${documentId}:${batchStart + i}`,
+              values: embeddings[i],
+              metadata: {
+                document_id: documentId,
+                chunk_index: batchStart + i,
+                stock_code: stockCode || '',
+                category: category || 'general',
+              },
+            }));
+            await this.vectorize.upsert(vectors);
+          } catch (vecError) {
+            // Vectorize 写入失败不阻塞入库（KV 仍可作为降级检索路径）
+            console.warn(`[RAG] Vectorize upsert failed for batch ${batchNum}:`, vecError);
+          }
+        }
         
         if (batchNum % 5 === 0 || batchStart + BATCH_SIZE >= totalChunks) {
-          console.log(`[RAG] Embedding progress: ${processedCount}/${totalChunks} chunks (batch ${batchNum})`);
+          console.log(`[RAG] Embedding progress: ${processedCount}/${totalChunks} chunks (batch ${batchNum})${this.vectorize ? ' [+Vectorize]' : ''}`);
         }
       }
       
@@ -791,7 +813,8 @@ export class RAGService {
   // ========== 检索 ==========
   
   /**
-   * 向量相似度检索
+   * 向量相似度检索 — 统一入口
+   * 优先使用 Cloudflare Vectorize（ANN ~10ms），失败时自动降级到 KV 全扫
    * 等价于 Python: vectorstore.similarity_search_with_score(query, k=top_k)
    */
   async searchSimilar(
@@ -801,6 +824,158 @@ export class RAGService {
       minScore?: number;
       stockCode?: string;  // 限定特定股票
       documentIds?: number[]; // 限定特定文档
+      category?: string;
+    } = {}
+  ): Promise<ChunkWithScore[]> {
+    // 优先走 Vectorize 路径
+    if (this.vectorize) {
+      try {
+        const results = await this.searchSimilarVectorize(query, options);
+        if (results.length > 0) {
+          console.log(`[RAG] Vectorize search: ${results.length} results, top score=${results[0]?.score.toFixed(3)}`);
+          return results;
+        }
+        console.log('[RAG] Vectorize returned 0 results, falling back to KV scan');
+      } catch (error) {
+        console.warn('[RAG] Vectorize search failed, falling back to KV scan:', error);
+      }
+    }
+    
+    // 降级：KV 全扫路径（旧方案）
+    return this.searchSimilarKV(query, options);
+  }
+
+  /**
+   * Vectorize 向量检索（新方案，ANN 近似最近邻）
+   * 
+   * 优势：
+   * - 单次 API 调用完成 ANN 搜索，~10ms 延迟
+   * - 支持 metadata filter（stock_code / document_id / category）
+   * - 无需从 KV 逐条加载 embedding
+   * 
+   * 限制：
+   * - topK 最大 100（不返回 values），50（返回 metadata）
+   * - 需要先通过 ingest 或 migrate 将向量写入 Vectorize
+   */
+  private async searchSimilarVectorize(
+    query: string,
+    options: {
+      topK?: number;
+      minScore?: number;
+      stockCode?: string;
+      documentIds?: number[];
+      category?: string;
+    } = {}
+  ): Promise<ChunkWithScore[]> {
+    const { topK = 5, minScore = 0.3, stockCode, documentIds, category } = options;
+    
+    if (!this.vectorize) return [];
+
+    // 1. 生成查询向量
+    const queryEmbedding = await generateEmbedding(query, this.embeddingConfig);
+
+    // 2. 构建 metadata filter
+    //    Vectorize filter 语法: { property: value } 或 { property: { $in: [...] } }
+    const filter: Record<string, any> = {};
+    if (stockCode) {
+      filter.stock_code = stockCode;
+    }
+    if (category) {
+      filter.category = category;
+    }
+    // 注意：documentIds 过滤通过 metadata filter 的 $in 操作符
+    // Vectorize 支持 $in 过滤，但 document_id 是 number 类型
+    if (documentIds && documentIds.length > 0) {
+      filter.document_id = { $in: documentIds };
+    }
+
+    // 3. Vectorize 查询（ANN，~10ms）
+    const matches = await this.vectorize.query(queryEmbedding, {
+      topK: Math.min(topK * 2, 50), // 多取一些以备 minScore 过滤
+      returnMetadata: 'all',
+      ...(Object.keys(filter).length > 0 ? { filter } : {}),
+    });
+
+    if (!matches.matches || matches.matches.length === 0) {
+      return [];
+    }
+
+    // 4. 过滤低分结果
+    const validMatches = matches.matches.filter(m => (m.score ?? 0) >= minScore);
+    if (validMatches.length === 0) return [];
+
+    // 5. 从 D1 获取 chunk 完整内容（Vectorize 只存 metadata，不存全文）
+    //    向量 ID 格式: "documentId:chunkIndex"
+    const chunkKeys = validMatches.map(m => {
+      const [docId, chunkIdx] = m.id.split(':');
+      return { docId: parseInt(docId), chunkIdx: parseInt(chunkIdx), score: m.score ?? 0, metadata: m.metadata };
+    });
+
+    // 用 chunk 的 document_id + chunk_index 批量查询
+    // 构建 (document_id, chunk_index) IN (...) 查询
+    const whereConditions = chunkKeys.map(() => '(c.document_id = ? AND c.chunk_index = ?)').join(' OR ');
+    const bindParams: any[] = [];
+    for (const ck of chunkKeys) {
+      bindParams.push(ck.docId, ck.chunkIdx);
+    }
+
+    const sql = `
+      SELECT c.id, c.document_id, c.chunk_index, c.content, c.content_length, c.embedding_key, c.metadata,
+             d.title as document_title
+      FROM rag_chunks c
+      JOIN rag_documents d ON c.document_id = d.id
+      WHERE (${whereConditions})
+        AND d.status = 'completed'
+    `;
+
+    const result = await this.db.prepare(sql).bind(...bindParams).all();
+    const chunkMap = new Map<string, any>();
+    for (const row of result.results || []) {
+      const key = `${row.document_id}:${row.chunk_index}`;
+      chunkMap.set(key, row);
+    }
+
+    // 6. 组装结果（按 Vectorize 返回的分数排序）
+    const scoredChunks: ChunkWithScore[] = [];
+    for (const ck of chunkKeys) {
+      const key = `${ck.docId}:${ck.chunkIdx}`;
+      const row = chunkMap.get(key);
+      if (!row) continue;
+
+      scoredChunks.push({
+        chunk: {
+          id: row.id as number,
+          documentId: row.document_id as number,
+          chunkIndex: row.chunk_index as number,
+          content: row.content as string,
+          contentLength: row.content_length as number,
+          embeddingKey: row.embedding_key as string,
+          hasEmbedding: true,
+          metadata: JSON.parse((row.metadata as string) || '{}'),
+        },
+        score: ck.score,
+        documentTitle: row.document_title as string,
+        documentId: row.document_id as number,
+      });
+    }
+
+    // 已按 Vectorize 分数排序，取 topK
+    return scoredChunks.slice(0, topK);
+  }
+
+  /**
+   * KV 全扫向量检索（旧方案，作为降级路径保留）
+   * 
+   * 逻辑：遍历所有 chunk 的 KV embedding，逐条计算 cosine similarity
+   * 性能：O(N)，>1000 chunks 时延迟 >3s
+   */
+  private async searchSimilarKV(
+    query: string,
+    options: {
+      topK?: number;
+      minScore?: number;
+      stockCode?: string;
+      documentIds?: number[];
       category?: string;
     } = {}
   ): Promise<ChunkWithScore[]> {
@@ -1059,12 +1234,12 @@ ${context ? '【知识库检索结果】\n' + context : '当前知识库中没�
   }
   
   /**
-   * 删除文档及其所有chunks和embeddings
+   * 删除文档及其所有chunks和embeddings（KV + Vectorize）
    */
   async deleteDocument(documentId: number): Promise<void> {
-    // 1. 获取所有embedding keys
+    // 1. 获取所有 chunk 信息（embedding keys + chunk_index 用于 Vectorize 清理）
     const chunks = await this.db.prepare(
-      'SELECT embedding_key FROM rag_chunks WHERE document_id = ? AND has_embedding = 1'
+      'SELECT embedding_key, chunk_index FROM rag_chunks WHERE document_id = ? AND has_embedding = 1'
     ).bind(documentId).all();
     
     // 2. 删除KV中的embedding
@@ -1074,8 +1249,20 @@ ${context ? '【知识库检索结果】\n' + context : '当前知识库中没�
         await this.kv.delete(key);
       }
     }
+
+    // 2b. 删除 Vectorize 中的向量
+    if (this.vectorize && chunks.results && chunks.results.length > 0) {
+      try {
+        const vectorIds = chunks.results.map(c => `${documentId}:${c.chunk_index}`);
+        // Vectorize deleteByIds 不限制批次大小
+        await this.vectorize.deleteByIds(vectorIds);
+        console.log(`[RAG] Vectorize: deleted ${vectorIds.length} vectors for document ${documentId}`);
+      } catch (vecError) {
+        console.warn(`[RAG] Vectorize delete failed for document ${documentId}:`, vecError);
+      }
+    }
     
-    // 3. 删除D1中的chunks
+    // 3. 删除D1中的chunks（FTS5 触发器会自动清理 FTS 索引）
     await this.db.prepare('DELETE FROM rag_chunks WHERE document_id = ?').bind(documentId).run();
     
     // 4. 删除D1中的document
@@ -1500,7 +1687,8 @@ export function createRAGService(
   db: D1Database,
   kv: KVNamespace,
   apiKey: string,
-  embeddingConfig?: EmbeddingConfig
+  embeddingConfig?: EmbeddingConfig,
+  vectorize?: Vectorize
 ): RAGService {
-  return new RAGService(db, kv, apiKey, embeddingConfig);
+  return new RAGService(db, kv, apiKey, embeddingConfig, vectorize);
 }

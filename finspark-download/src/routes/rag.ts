@@ -15,6 +15,7 @@ import { Hono } from 'hono';
 import type { Bindings } from '../types';
 import { createRAGService, createEmbeddingConfig } from '../services/rag';
 import { createBM25Service } from '../services/ragBm25';
+import { createFTS5Service } from '../services/ragFts5';
 import { createIntentService } from '../services/ragIntent';
 import { createPipelineService } from '../services/ragPipeline';
 import { createPdfParserService, cleanMineruMarkdown, validatePdfSize, extractStructuredBlocks } from '../services/ragPdfParser';
@@ -43,7 +44,7 @@ function createRAGServiceFromEnv(env: Bindings) {
     // 否则回退到 VectorEngine
   });
 
-  return createRAGService(env.DB, env.CACHE, apiKey, embeddingConfig);
+  return createRAGService(env.DB, env.CACHE, apiKey, embeddingConfig, env.VECTORIZE);
 }
 
 /**
@@ -101,8 +102,9 @@ function createPipelineServiceFromEnv(env: Bindings) {
   const intentService = createIntentService(intentLlmConfig.apiKey, intentLlmConfig.baseUrl, intentLlmConfig.model, intentLlmConfig.extraHeaders);
   
   const autoSyncService = createAutoSyncService(env.DB, env.CACHE, apiKey);
+  const fts5Service = createFTS5Service(env.DB);
 
-  return createPipelineService(env.DB, env.CACHE, ragService, bm25Service, intentService, apiKey, autoSyncService, gpuProvider);
+  return createPipelineService(env.DB, env.CACHE, ragService, bm25Service, intentService, apiKey, autoSyncService, gpuProvider, fts5Service);
 }
 
 // ==================== 文档管理（原有）====================

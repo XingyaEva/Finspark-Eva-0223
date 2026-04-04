@@ -636,4 +636,6 @@ export interface Bindings {
   LANGFUSE_PUBLIC_KEY?: string;
   /** Langfuse 可观测性平台 Base URL (默认 https://cloud.langfuse.com) */
   LANGFUSE_BASE_URL?: string;
+  /** Vectorize 向量数据库 (RAG 语义检索, 替代 KV 全扫方案) */
+  VECTORIZE?: Vectorize;
 }
