@@ -39,10 +39,34 @@ export interface SyncTask {
   errorMessage?: string;
   /** 重试次数 */
   retryCount: number;
+  /** MinerU 解析任务 ID */
+  mineruTaskId?: string;
+  /** MinerU 解析结果下载 URL（markdown 或 zip） */
+  mineruResultUrl?: string;
   /** 任务创建时间 */
   createdAt?: string;
   /** 最后更新时间 */
   updatedAt?: string;
+}
+
+/**
+ * advanceSyncTask 的返回值
+ */
+export interface AdvanceResult {
+  /** 任务 ID */
+  taskId: number;
+  /** 执行前状态 */
+  previousStatus: string;
+  /** 执行后状态 */
+  currentStatus: string;
+  /** 当前进度 */
+  progress: number;
+  /** 本次推进的描述 */
+  action: string;
+  /** 是否需要继续调用 advance */
+  needsMoreAdvance: boolean;
+  /** 错误信息（如有） */
+  error?: string;
 }
 
 export interface SyncStatus {
@@ -210,7 +234,7 @@ export function createAutoSyncService(
    */
   async function updateSyncTask(
     taskId: number,
-    updates: Partial<Pick<SyncTask, 'status' | 'progress' | 'announcementId' | 'pdfUrl' | 'documentId' | 'chunkCount' | 'errorMessage' | 'retryCount'>>
+    updates: Partial<Pick<SyncTask, 'status' | 'progress' | 'announcementId' | 'pdfUrl' | 'documentId' | 'chunkCount' | 'errorMessage' | 'retryCount' | 'mineruTaskId' | 'mineruResultUrl'>>
   ): Promise<void> {
     const setClauses: string[] = ['updated_at = datetime(\'now\')'];
     const binds: any[] = [];
@@ -246,6 +270,14 @@ export function createAutoSyncService(
     if (updates.retryCount !== undefined) {
       setClauses.push('retry_count = ?');
       binds.push(updates.retryCount);
+    }
+    if (updates.mineruTaskId !== undefined) {
+      setClauses.push('mineru_task_id = ?');
+      binds.push(updates.mineruTaskId);
+    }
+    if (updates.mineruResultUrl !== undefined) {
+      setClauses.push('mineru_result_url = ?');
+      binds.push(updates.mineruResultUrl);
     }
 
     await db.prepare(
@@ -524,6 +556,487 @@ export function createAutoSyncService(
   }
 
   /**
+   * 分步推进同步任务（状态机模式）
+   * 
+   * 设计原理：
+   * - Cloudflare Workers waitUntil 仅在客户端断开后给 30 秒
+   * - MinerU 解析大型年报 PDF 需要 5-15 分钟
+   * - 不可能在单次 HTTP 请求中完成整个流程
+   * 
+   * 解决方案：每次调用 advance 只执行当前状态的下一步：
+   *   pending    → searching: 搜索巨潮公告，找到 PDF URL
+   *   searching  → parsing:   提交 MinerU 解析任务
+   *   parsing    → parsing:   轮询 MinerU 一次（未完成则仍为 parsing）
+   *   parsing    → ingesting: MinerU 完成 → 下载 markdown
+   *   ingesting  → completed: 分块 + embedding + 入库
+   * 
+   * 外部调用方只需循环调用 advance 直到 completed/failed
+   */
+  async function advanceSyncTask(
+    taskId: number,
+    services: {
+      cninfo: import('./ragCninfo').CninfoService;
+      pdfParser: ReturnType<typeof import('./ragPdfParser').createPdfParserService>;
+      ragService: import('./rag').RAGService;
+      bm25Service: import('./ragBm25').BM25Service;
+    }
+  ): Promise<AdvanceResult> {
+    const task = await db.prepare(
+      'SELECT * FROM rag_sync_tasks WHERE id = ?'
+    ).bind(taskId).first();
+
+    if (!task) {
+      return {
+        taskId,
+        previousStatus: 'unknown',
+        currentStatus: 'unknown',
+        progress: 0,
+        action: 'task_not_found',
+        needsMoreAdvance: false,
+        error: `Task #${taskId} not found`,
+      };
+    }
+
+    const status = task.status as string;
+    const stockCode = task.stock_code as string;
+    const reportType = task.report_type as string;
+    const reportYear = task.report_year as number;
+
+    // 终态：不需要推进
+    if (status === 'completed' || status === 'failed') {
+      return {
+        taskId,
+        previousStatus: status,
+        currentStatus: status,
+        progress: (task.progress as number) || 0,
+        action: 'already_terminal',
+        needsMoreAdvance: false,
+      };
+    }
+
+    try {
+      // ==================== Step: pending → searching ====================
+      if (status === 'pending') {
+        await updateSyncTask(taskId, { status: 'searching', progress: 10 });
+
+        let pdfUrl = task.pdf_url as string;
+        if (!pdfUrl) {
+          const reports = await services.cninfo.searchFinancialReports(
+            stockCode,
+            reportType as any,
+            reportYear
+          );
+
+          if (reports.length === 0) {
+            throw new Error(`未找到 ${stockCode} ${reportYear} 年${reportType === 'annual' ? '年报' : '财报'}`);
+          }
+
+          const targetReport = reports[0];
+          pdfUrl = targetReport.pdfUrl;
+          await updateSyncTask(taskId, {
+            announcementId: targetReport.announcementId,
+            pdfUrl,
+            progress: 20,
+          });
+        }
+
+        // 立刻进入下一步：提交 MinerU
+        console.log(`[AutoSync:advance] Task #${taskId}: submitting to MinerU: ${pdfUrl}`);
+        const taskSubmitResult = await services.pdfParser.submitTaskByUrl(pdfUrl, {
+          enableOcr: true,
+          enableTable: true,
+          enableFormula: true,
+        });
+
+        await updateSyncTask(taskId, {
+          status: 'parsing',
+          progress: 40,
+          mineruTaskId: taskSubmitResult.taskId,
+        });
+
+        return {
+          taskId,
+          previousStatus: 'pending',
+          currentStatus: 'parsing',
+          progress: 40,
+          action: `cninfo_search_done_mineru_submitted (mineru_task=${taskSubmitResult.taskId})`,
+          needsMoreAdvance: true,
+        };
+      }
+
+      // ==================== Step: searching → parsing ====================
+      // (此状态说明上次提交 MinerU 之前中断了)
+      if (status === 'searching') {
+        let pdfUrl = task.pdf_url as string;
+        if (!pdfUrl) {
+          const reports = await services.cninfo.searchFinancialReports(
+            stockCode,
+            reportType as any,
+            reportYear
+          );
+          if (reports.length === 0) {
+            throw new Error(`未找到 ${stockCode} ${reportYear} 年${reportType === 'annual' ? '年报' : '财报'}`);
+          }
+          pdfUrl = reports[0].pdfUrl;
+          await updateSyncTask(taskId, {
+            announcementId: reports[0].announcementId,
+            pdfUrl,
+          });
+        }
+
+        const mineruTaskId = task.mineru_task_id as string;
+        if (mineruTaskId) {
+          // 已有 MinerU 任务，直接进入 polling
+          await updateSyncTask(taskId, { status: 'parsing', progress: 40 });
+          return {
+            taskId,
+            previousStatus: 'searching',
+            currentStatus: 'parsing',
+            progress: 40,
+            action: `resumed_existing_mineru_task (${mineruTaskId})`,
+            needsMoreAdvance: true,
+          };
+        }
+
+        // 提交新的 MinerU 任务
+        const taskSubmitResult = await services.pdfParser.submitTaskByUrl(pdfUrl, {
+          enableOcr: true,
+          enableTable: true,
+          enableFormula: true,
+        });
+
+        await updateSyncTask(taskId, {
+          status: 'parsing',
+          progress: 40,
+          mineruTaskId: taskSubmitResult.taskId,
+        });
+
+        return {
+          taskId,
+          previousStatus: 'searching',
+          currentStatus: 'parsing',
+          progress: 40,
+          action: `mineru_submitted (mineru_task=${taskSubmitResult.taskId})`,
+          needsMoreAdvance: true,
+        };
+      }
+
+      // ==================== Step: downloading → parsing ====================
+      // (旧流程遗留状态，等同于 searching)
+      if (status === 'downloading') {
+        const pdfUrl = task.pdf_url as string;
+        if (!pdfUrl) {
+          throw new Error('No PDF URL found for downloading task');
+        }
+
+        const mineruTaskId = task.mineru_task_id as string;
+        if (mineruTaskId) {
+          await updateSyncTask(taskId, { status: 'parsing', progress: 40 });
+          return {
+            taskId,
+            previousStatus: 'downloading',
+            currentStatus: 'parsing',
+            progress: 40,
+            action: `resumed_existing_mineru_task (${mineruTaskId})`,
+            needsMoreAdvance: true,
+          };
+        }
+
+        const taskSubmitResult = await services.pdfParser.submitTaskByUrl(pdfUrl, {
+          enableOcr: true,
+          enableTable: true,
+          enableFormula: true,
+        });
+
+        await updateSyncTask(taskId, {
+          status: 'parsing',
+          progress: 40,
+          mineruTaskId: taskSubmitResult.taskId,
+        });
+
+        return {
+          taskId,
+          previousStatus: 'downloading',
+          currentStatus: 'parsing',
+          progress: 40,
+          action: `mineru_submitted (mineru_task=${taskSubmitResult.taskId})`,
+          needsMoreAdvance: true,
+        };
+      }
+
+      // ==================== Step: parsing → 检查 MinerU 状态 ====================
+      if (status === 'parsing') {
+        const mineruTaskId = task.mineru_task_id as string;
+        
+        if (!mineruTaskId) {
+          // 没有 MinerU 任务 ID（旧流程卡住的任务），需要重新提交
+          const pdfUrl = task.pdf_url as string;
+          if (!pdfUrl) {
+            throw new Error('Task in parsing state but no PDF URL or MinerU task ID');
+          }
+
+          console.log(`[AutoSync:advance] Task #${taskId}: no MinerU task ID, re-submitting`);
+          const taskSubmitResult = await services.pdfParser.submitTaskByUrl(pdfUrl, {
+            enableOcr: true,
+            enableTable: true,
+            enableFormula: true,
+          });
+
+          await updateSyncTask(taskId, {
+            progress: 40,
+            mineruTaskId: taskSubmitResult.taskId,
+          });
+
+          return {
+            taskId,
+            previousStatus: 'parsing',
+            currentStatus: 'parsing',
+            progress: 40,
+            action: `resubmitted_to_mineru (mineru_task=${taskSubmitResult.taskId})`,
+            needsMoreAdvance: true,
+          };
+        }
+
+        // 已有 MinerU 任务，检查一次状态（不轮询，立即返回）
+        console.log(`[AutoSync:advance] Task #${taskId}: checking MinerU task ${mineruTaskId}`);
+        
+        // 使用 pdfParser 的 checkTaskOnce（单次检查，非轮询）
+        const mineruCheckResult = await services.pdfParser.checkTaskOnce(mineruTaskId);
+        const mineruState = mineruCheckResult.state;
+        console.log(`[AutoSync:advance] Task #${taskId}: MinerU state = ${mineruState}`);
+
+        if (mineruState === 'done') {
+          // MinerU 完成！保存结果 URL，进入 ingesting
+          const resultUrl = mineruCheckResult.fullZipUrl || mineruCheckResult.fullMarkdownUrl || '';
+          const pageCount = mineruCheckResult.pageCount;
+          
+          await updateSyncTask(taskId, {
+            status: 'ingesting',
+            progress: 60,
+            mineruResultUrl: resultUrl,
+          });
+
+          return {
+            taskId,
+            previousStatus: 'parsing',
+            currentStatus: 'ingesting',
+            progress: 60,
+            action: `mineru_done (pages=${pageCount || '?'}, url=${resultUrl ? 'yes' : 'no'})`,
+            needsMoreAdvance: true,
+          };
+        }
+
+        if (mineruState === 'failed') {
+          const errorMsg = mineruCheckResult.errorMessage || 'MinerU task failed';
+          throw new Error(`MinerU 解析失败: ${errorMsg}`);
+        }
+
+        // 仍在处理中（pending / running）
+        return {
+          taskId,
+          previousStatus: 'parsing',
+          currentStatus: 'parsing',
+          progress: Math.min((task.progress as number) || 40, 55),
+          action: `mineru_still_processing (state=${mineruState})`,
+          needsMoreAdvance: true,
+        };
+      }
+
+      // ==================== Step: ingesting → completed ====================
+      if (status === 'ingesting') {
+        const mineruResultUrl = (task.mineru_result_url as string) || '';
+
+        if (!mineruResultUrl) {
+          throw new Error('Task in ingesting state but no MinerU result URL');
+        }
+
+        // 下载 markdown
+        console.log(`[AutoSync:advance] Task #${taskId}: downloading markdown from ${mineruResultUrl}`);
+        const markdown = await services.pdfParser.downloadMarkdown(mineruResultUrl);
+
+        if (!markdown || markdown.trim().length === 0) {
+          throw new Error('MinerU 解析结果为空');
+        }
+
+        await updateSyncTask(taskId, { progress: 70 });
+
+        // 清理 Markdown 并提取结构化块
+        const { cleanMineruMarkdown, extractStructuredBlocks } = await import('./ragPdfParser');
+        const cleanedMarkdown = cleanMineruMarkdown(markdown);
+        const structuredBlocks = extractStructuredBlocks(cleanedMarkdown);
+
+        await updateSyncTask(taskId, { progress: 75 });
+
+        // 注入 BM25 回调
+        services.ragService.setBM25BuildCallback(async (docId: number) => {
+          await services.bm25Service.buildIndexForDocument(docId);
+        });
+
+        const reportTypeLabel = reportType === 'annual' ? '年报' : reportType === 'semi_annual' ? '半年报' : reportType === 'q1' ? '一季报' : '三季报';
+        const docTitle = `${task.stock_name || stockCode} ${reportYear}年${reportTypeLabel}`;
+
+        console.log(`[AutoSync:advance] Task #${taskId}: ingesting "${docTitle}" (${cleanedMarkdown.length} chars, ${structuredBlocks.length} blocks)`);
+
+        const ingestResult = await services.ragService.ingestDocument({
+          title: docTitle,
+          content: cleanedMarkdown,
+          fileName: `${stockCode}_${reportYear}_${reportType}.pdf`,
+          fileType: 'pdf',
+          stockCode: stockCode,
+          stockName: task.stock_name as string || undefined,
+          category: reportType === 'annual' ? 'annual_report' : 'quarterly_report',
+          tags: [reportType, String(reportYear), stockCode],
+          chunkSize: 500,
+          chunkOverlap: 100,
+          structuredBlocks,
+        });
+
+        await updateSyncTask(taskId, {
+          status: 'completed',
+          progress: 100,
+          documentId: ingestResult.documentId,
+          chunkCount: ingestResult.chunkCount,
+        });
+
+        console.log(`[AutoSync:advance] Task #${taskId}: COMPLETED → docId=${ingestResult.documentId}, chunks=${ingestResult.chunkCount}`);
+
+        return {
+          taskId,
+          previousStatus: 'ingesting',
+          currentStatus: 'completed',
+          progress: 100,
+          action: `ingested (docId=${ingestResult.documentId}, chunks=${ingestResult.chunkCount})`,
+          needsMoreAdvance: false,
+        };
+      }
+
+      // 未知状态
+      return {
+        taskId,
+        previousStatus: status,
+        currentStatus: status,
+        progress: (task.progress as number) || 0,
+        action: `unknown_status`,
+        needsMoreAdvance: false,
+        error: `Unhandled status: ${status}`,
+      };
+
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : '推进失败';
+      console.error(`[AutoSync:advance] Task #${taskId} failed at ${status}:`, errorMsg);
+
+      const currentRetry = (task.retry_count as number) || 0;
+      await updateSyncTask(taskId, {
+        status: 'failed',
+        errorMessage: errorMsg,
+        retryCount: currentRetry + 1,
+      });
+
+      return {
+        taskId,
+        previousStatus: status,
+        currentStatus: 'failed',
+        progress: (task.progress as number) || 0,
+        action: 'error',
+        needsMoreAdvance: false,
+        error: errorMsg,
+      };
+    }
+  }
+
+  /**
+   * 重置卡住/失败的任务以便重新推进
+   * 
+   * 策略：
+   * - failed 任务 → 回退到适当状态重新开始
+   * - 长时间停滞的 parsing/ingesting 任务 → 也可以重置
+   */
+  async function resetTaskForRetry(
+    taskId: number,
+    options?: { force?: boolean }
+  ): Promise<{ success: boolean; message: string; newStatus?: string }> {
+    const task = await db.prepare(
+      'SELECT * FROM rag_sync_tasks WHERE id = ?'
+    ).bind(taskId).first();
+
+    if (!task) {
+      return { success: false, message: 'Task not found' };
+    }
+
+    const status = task.status as string;
+    const retryCount = (task.retry_count as number) || 0;
+
+    if (status === 'completed') {
+      return { success: false, message: 'Task already completed' };
+    }
+
+    // 如果已有 MinerU 任务且状态是 parsing，重置到 parsing 让 advance 重新检查
+    const mineruTaskId = task.mineru_task_id as string;
+    const pdfUrl = task.pdf_url as string;
+
+    let newStatus: string;
+    let newProgress: number;
+
+    if (mineruTaskId && pdfUrl) {
+      // 有 MinerU 任务 ID 和 PDF URL → 回到 parsing 状态让 advance 检查 MinerU
+      newStatus = 'parsing';
+      newProgress = 40;
+    } else if (pdfUrl) {
+      // 有 PDF URL 但没有 MinerU 任务 → 回到 searching 让 advance 重新提交
+      newStatus = 'searching';
+      newProgress = 20;
+    } else {
+      // 什么都没有 → 回到 pending 从头开始
+      newStatus = 'pending';
+      newProgress = 0;
+    }
+
+    await updateSyncTask(taskId, {
+      status: newStatus as any,
+      progress: newProgress,
+      errorMessage: `Reset for retry (previous: ${status}, retry #${retryCount + 1})`,
+    });
+
+    console.log(`[AutoSync:reset] Task #${taskId}: ${status} → ${newStatus}`);
+
+    return {
+      success: true,
+      message: `Task reset from ${status} to ${newStatus}`,
+      newStatus,
+    };
+  }
+
+  /**
+   * 批量重置长时间停滞的任务
+   * 
+   * @param staleMinutes 超过多少分钟没更新视为停滞（默认 10 分钟）
+   */
+  async function resetStaleTasks(staleMinutes: number = 10): Promise<{
+    resetCount: number;
+    tasks: Array<{ id: number; oldStatus: string; newStatus: string }>;
+  }> {
+    const result = await db.prepare(
+      `SELECT * FROM rag_sync_tasks 
+       WHERE status NOT IN ('completed', 'failed')
+       AND updated_at < datetime('now', ? || ' minutes')
+       ORDER BY id`
+    ).bind(`-${staleMinutes}`).all();
+
+    const tasks: Array<{ id: number; oldStatus: string; newStatus: string }> = [];
+
+    for (const row of (result.results || [])) {
+      const taskId = row.id as number;
+      const oldStatus = row.status as string;
+      const resetResult = await resetTaskForRetry(taskId);
+      if (resetResult.success && resetResult.newStatus) {
+        tasks.push({ id: taskId, oldStatus, newStatus: resetResult.newStatus });
+      }
+    }
+
+    return { resetCount: tasks.length, tasks };
+  }
+
+  /**
    * 获取同步任务列表
    */
   async function listSyncTasks(params?: {
@@ -579,6 +1092,9 @@ export function createAutoSyncService(
     updateSyncTask,
     triggerSync,
     executeSyncTask,
+    advanceSyncTask,
+    resetTaskForRetry,
+    resetStaleTasks,
     ensureReportsAvailable,
     listSyncTasks,
     getSyncTask,
@@ -602,6 +1118,8 @@ function rowToSyncTask(row: Record<string, unknown>): SyncTask {
     chunkCount: row.chunk_count as number | undefined,
     errorMessage: row.error_message as string | undefined,
     retryCount: (row.retry_count as number) || 0,
+    mineruTaskId: row.mineru_task_id as string | undefined,
+    mineruResultUrl: row.mineru_result_url as string | undefined,
     createdAt: row.created_at as string | undefined,
     updatedAt: row.updated_at as string | undefined,
   };

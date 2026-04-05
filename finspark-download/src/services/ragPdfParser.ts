@@ -576,12 +576,55 @@ export function createPdfParserService(config: MinerUConfig) {
     }
   }
 
+  /**
+   * 检查 MinerU 任务状态（单次，不轮询）
+   * 用于 advance 模式下每次只检查一次状态
+   */
+  async function checkTaskOnce(taskId: string): Promise<{
+    state: 'pending' | 'running' | 'done' | 'failed' | 'unknown';
+    fullZipUrl?: string;
+    fullMarkdownUrl?: string;
+    pageCount?: number;
+    errorMessage?: string;
+  }> {
+    try {
+      const resp = await fetch(`${baseUrl}/api/v4/extract/task/${taskId}`, {
+        method: 'GET',
+        headers,
+      });
+
+      if (!resp.ok) {
+        console.warn(`[MinerU] checkTaskOnce failed (${resp.status})`);
+        return { state: 'unknown' };
+      }
+
+      const data = await resp.json() as any;
+      if (data.code !== 0) {
+        console.warn(`[MinerU] checkTaskOnce error: ${data.msg}`);
+        return { state: 'unknown' };
+      }
+
+      const state = data.data?.state || 'unknown';
+      return {
+        state,
+        fullZipUrl: data.data?.full_zip_url,
+        fullMarkdownUrl: data.data?.full_markdown_url,
+        pageCount: data.data?.page_count,
+        errorMessage: data.data?.error_message,
+      };
+    } catch (e) {
+      console.warn(`[MinerU] checkTaskOnce exception:`, e);
+      return { state: 'unknown' };
+    }
+  }
+
   return {
     parsePdf,
     parsePdfLightweight,
     submitTaskByUrl,
     submitTaskByFile,
     pollTaskStatus,
+    checkTaskOnce,
     downloadMarkdown,
     checkHealth,
   };

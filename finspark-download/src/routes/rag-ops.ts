@@ -538,4 +538,59 @@ ragOps.get('/search-compare', async (c) => {
   }
 });
 
+// ==================== 临时迁移端点 ====================
+
+/**
+ * POST /admin/apply-migration - 执行 SQL 迁移语句
+ * 
+ * Body: { statements: string[], label?: string }
+ * 注意：此端点仅供运维使用，生产环境应禁用或加鉴权
+ */
+ragOps.post('/admin/apply-migration', async (c) => {
+  try {
+    const { statements, label } = await c.req.json() as { statements: string[]; label?: string };
+    
+    if (!statements || !Array.isArray(statements) || statements.length === 0) {
+      return c.json({ success: false, error: 'No statements provided' }, 400);
+    }
+
+    const db = c.env.DB;
+    const results: Array<{ index: number; sql: string; success: boolean; error?: string }> = [];
+
+    for (let i = 0; i < statements.length; i++) {
+      const sql = statements[i].trim();
+      if (!sql) continue;
+      
+      try {
+        await db.prepare(sql).run();
+        results.push({ index: i, sql: sql.substring(0, 80), success: true });
+      } catch (err) {
+        results.push({
+          index: i,
+          sql: sql.substring(0, 80),
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    const succeeded = results.filter(r => r.success).length;
+    const failed = results.filter(r => !r.success).length;
+
+    return c.json({
+      success: true,
+      label: label || 'unnamed',
+      total: results.length,
+      succeeded,
+      failed,
+      results,
+    });
+  } catch (error) {
+    return c.json({
+      success: false,
+      error: error instanceof Error ? error.message : '迁移执行失败',
+    }, 500);
+  }
+});
+
 export default ragOps;
