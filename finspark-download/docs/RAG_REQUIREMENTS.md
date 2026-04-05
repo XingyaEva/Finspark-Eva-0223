@@ -1,10 +1,10 @@
 # FinSpark RAG 财报智能问答系统 — 需求与设计文档
 
-> **版本**: v1.0  
-> **日期**: 2026-04-03  
+> **版本**: v2.0  
+> **日期**: 2026-04-05  
 > **项目**: FinSpark Investment Analysis Platform  
-> **代码规模**: ~10,171 行 TypeScript（14 个 RAG 服务模块 + 4 个路由模块）  
-> **状态**: 核心流水线已验证通过
+> **代码规模**: ~12,000+ 行 TypeScript（16 个 RAG 服务模块 + 5 个路由模块）  
+> **状态**: 核心流水线已验证通过；Plan C (Vectorize + FTS5) 已合并
 
 ---
 
@@ -17,11 +17,13 @@
 - [第五章 · Prompt 模板库设计](#第五章--prompt-模板库设计)
 - [第六章 · 元数据体系与父子页面检索策略](#第六章--元数据体系与父子页面检索策略)
 - [第七章 · 检索与生成流水线](#第七章--检索与生成流水线rag-pipeline)
+- [第七A章 · Plan C 检索优化与降级策略（已实施）](#第七a章--plan-c-检索优化与降级策略已实施)
 - [第八章 · GPU 部署与路由架构](#第八章--gpu-部署与路由架构)
 - [第九章 · 数据自动同步](#第九章--数据自动同步autosync)
 - [第十章 · 质量保障体系](#第十章--质量保障体系)
 - [第十一章 · 版本管理与运维](#第十一章--版本管理与运维)
-- [第十二章 · 演进路线图与优先级](#第十二章--演进路线图与优先级)
+- [第十二章 · 可观测性与评估体系（Langfuse + OpenEvals）](#第十二章--可观测性与评估体系langfuse--openevals)
+- [第十三章 · 演进路线图与优先级](#第十三章--演进路线图与优先级)
 - [附录](#附录)
 
 ---
@@ -96,12 +98,14 @@ graph TB
 |---|---|---|
 | **运行时** | Cloudflare Workers (Hono) | 边缘计算，全球低延迟 |
 | **关系存储** | Cloudflare D1 (SQLite) | 14 张 RAG 相关表 |
-| **向量存储** | Cloudflare KV | 键 `rag:emb:{docId}:{chunkIdx}` |
+| **向量存储** | Cloudflare KV + **Cloudflare Vectorize** ✅ | KV 键 `rag:emb:{docId}:{chunkIdx}` + Vectorize ANN 索引 |
 | **PDF 解析** | MinerU API v4 / GPU Self-hosted | OCR + 表格 + 公式提取 |
 | **Embedding** | DashScope v4 (Cloud) / BGE-M3 (GPU) | 1024-dim 双轨 |
 | **LLM** | Qwen3-14B-AWQ (GPU) / GPT-4.1 (Cloud) | SGLang 推理引擎 |
 | **Reranker** | BGE-Reranker-v2-m3 (GPU) | 交叉编码器，<50ms |
-| **BM25** | 自研 `ragBm25.ts` | Intl.Segmenter 中文分词 |
+| **全文检索** | **D1 FTS5** ✅ (新) + 自研 `ragBm25.ts` (降级) | FTS5 原生 BM25 + 触发器自动同步 |
+| **可观测性** | **Langfuse** (自部署) | 全链路 Trace、成本追踪、Prompt 管理 |
+| **质量评估** | **OpenEvals** (TypeScript) | LLM-as-Judge、字段级 Rubric、轨迹评估 |
 | **前端** | Hono SSR | 18 个 RAG 管理页面 |
 
 ### 1.4 系统边界与约束条件
@@ -109,7 +113,7 @@ graph TB
 | 约束 | 影响 | 应对策略 |
 |---|---|---|
 | Workers CPU 限时 30-50s | 大文档 embedding 可能超时 | `waitUntil()` + D1 批量写入 |
-| KV 无 ANN 索引 | 只能暴力遍历余弦相似度 | <50k chunks 可接受 (~200ms) |
+| KV 无 ANN 索引 | 只能暴力遍历余弦相似度 | ✅ 已通过 Vectorize ANN 解决（~10ms），KV 保留为降级方案 |
 | D1 单写者 | 并发写入可能冲突 | `db.batch()` 合并写操作 |
 | KV 单值 25MB 限制 | 向量以 JSON float[] 存储 | 每 chunk 一个 KV key |
 | GPU 服务器在国内 | 与边缘 Worker RTT ~500ms | SSH 隧道 + Nginx 代理 + 自动降级 |
@@ -119,18 +123,29 @@ graph TB
 
 ## 第二章 · 向量数据库选型（建议与决策）
 
-### 2.1 当前方案：Cloudflare KV + 暴力余弦检索
+### 2.1 当前方案：Cloudflare Vectorize (主) + KV (降级) ✅ 已实施
 
-**架构细节**：
+> **v2.0 更新 (2026-04-05)**：Plan C 已将向量检索从 KV 暴力扫描升级为 Cloudflare Vectorize ANN。
+
+**当前架构（双路径）**：
+
+| 路径 | 实现 | 延迟 | 触发条件 |
+|------|------|------|----------|
+| **主路径** — Vectorize ANN | `searchSimilarVectorize()` in `rag.ts` | ~10-30ms | `env.VECTORIZE` 存在且可用 |
+| **降级路径** — KV 暴力扫描 | `searchSimilarKV()` in `rag.ts` | ~200ms-3s | Vectorize 未绑定 / 查询失败 / 结果为空 |
+
+**Vectorize 索引详情**：
+- 索引名：`finspark-rag-index`
+- 维度：1024（与 DashScope / BGE-M3 一致）
+- 度量：cosine
+- 元数据索引：`stock_code (string)`, `document_id (number)`, `category (string)`
+- 容量：最大 10,000,000 向量（当前远未达到）
+
+**KV 降级路径保留原因**：
 - 向量存储键格式：`rag:emb:{documentId}:{chunkIndex}`
-- 向量格式：JSON `float[1024]`（1024 维浮点数组）
+- 向量格式：JSON `float[1024]`
 - 检索方式：加载全部候选向量 → 逐一计算余弦相似度 → 排序取 Top-K
-- 实测性能：~3,000 chunks 时检索耗时约 200ms，可接受
-
-**选择此方案的原因**：
-1. Cloudflare Workers 生态原生支持 KV，零额外依赖
-2. 早期阶段数据量小（<10k chunks），暴力检索足够
-3. 避免引入外部向量数据库带来的网络延迟和运维成本
+- 适用场景：Vectorize 索引未创建时（本地开发、新部署过渡期）
 
 ### 2.2 候选数据库完整对比矩阵
 
@@ -203,39 +218,50 @@ graph TB
 - **局限性**：不适合大规模生产；持久化和分布式支持有限
 - **适用场景**：POC / 原型开发，本地测试
 
-### 2.4 分阶段演进建议
+### 2.4 分阶段演进建议（已更新）
 
 ```
-Phase 1 (当前 ≤50k chunks)     Phase 2 (50k–500k)              Phase 3 (>500k)
+Phase 1 (已完成 ✅)             Phase 2 (当前 ✅)                Phase 3 (>500k)
 ┌─────────────────────┐     ┌────────────────────────┐     ┌──────────────────────┐
 │  Cloudflare KV      │     │  Cloudflare Vectorize  │     │  Milvus / Qdrant     │
-│  + 暴力余弦检索     │ ──► │  或 Elasticsearch      │ ──► │  分布式集群          │
-│  ~200ms / 3k chunks │     │  ANN + 混合检索        │     │  ANN + 混合 + 过滤   │
+│  + 暴力余弦检索     │ ──► │  + D1 FTS5 混合检索    │ ──► │  分布式集群          │
+│  ~200ms / 3k chunks │     │  ANN ~10ms + BM25 ~5ms │     │  ANN + 混合 + 过滤   │
 └─────────────────────┘     └────────────────────────┘     └──────────────────────┘
-  ✅ 零依赖，零成本            中等运维，性能提升 10x+          企业级，水平扩展
+  ✅ 已完成                      ✅ Plan C 已实施                企业级，水平扩展
 ```
 
-| 阶段 | 时间 | 数据规模 | 推荐方案 | 决策理由 |
+| 阶段 | 时间 | 数据规模 | 方案 | 状态 |
 |---|---|---|---|---|
-| **Phase 1** | 当前 | ≤50k chunks | Cloudflare KV | 零额外成本，当前性能可接受 |
-| **Phase 2** | 中期 1-2月 | 50k-500k | **Cloudflare Vectorize** (首选) 或 **Elasticsearch** | Vectorize 与 Workers 原生集成；ES 适合需要混合检索的场景 |
-| **Phase 3** | 长期 3-6月 | >500k | **Milvus** (Zilliz Cloud) 或 **Qdrant** | 水平扩展能力强，支持亿级向量 |
+| **Phase 1** | 2026-03 | ≤50k chunks | Cloudflare KV 暴力检索 | ✅ 已完成，保留为降级方案 |
+| **Phase 2** | 2026-04 (当前) | 50k-500k | **Cloudflare Vectorize + D1 FTS5** | ✅ Plan C 已合并 (PR #4) |
+| **Phase 3** | 长期 3-6月 | >500k | **Milvus** (Zilliz Cloud) 或 **Qdrant** | 待评估 |
 
-### 2.5 推荐决策 Trade-off 分析
+### 2.5 选型决策结果（已实施）
 
-**结合 FinSpark 实际场景的推荐**：
+> **最终选型：Cloudflare Vectorize + D1 FTS5 混合检索（Plan C）**
 
-1. **短期维持 KV**：当前已入库文档 <10 个，chunks <5k，暴力检索完全可行
-2. **中期首选 Cloudflare Vectorize**：
-   - ✅ 与 Workers 零延迟集成（同一边缘节点）
-   - ✅ 无需额外运维，按用量付费
-   - ✅ 支持标准 ANN 检索
-   - ⚠️ 不支持混合检索（BM25 仍需独立维护）
-3. **若需混合检索，考虑 Elasticsearch**：
-   - ✅ 关键词 + 向量一站式解决
-   - ⚠️ 需要额外部署和运维
-4. **不建议 Pinecone**：国内访问延迟大，闭源数据安全风险
-5. **不建议 FAISS**：适合静态数据，FinSpark 需要频繁更新
+**选型决策理由**：
+
+1. ✅ **Vectorize — 向量检索主引擎**
+   - 与 Workers 零延迟集成（同一边缘节点），ANN 检索 ~10ms
+   - 无需额外运维，包含在 Workers Paid ($5/mo) 中，零增量成本
+   - 支持元数据过滤（stock_code, category, document_id）
+   - 容量 10M 向量，满足中期需求
+
+2. ✅ **D1 FTS5 — 全文检索主引擎（替代自建 BM25）**
+   - SQLite FTS5 原生 BM25 评分，单次 MATCH 查询完成（~5ms）
+   - 触发器自动同步，入库零额外代码
+   - 支持前缀、短语、布尔查询
+   - 消除了旧 BM25 的 4-5 轮 DB round-trip 瓶颈
+
+3. ✅ **双重降级保护**
+   - 向量检索：Vectorize → KV 暴力扫描
+   - 全文检索：FTS5 → 旧 BM25 倒排索引
+
+4. ❌ **排除方案**：
+   - Pinecone：国内访问延迟大，闭源数据安全风险
+   - FAISS：适合静态数据，FinSpark 需要频繁更新
+   - Elasticsearch：功能强但引入额外基础设施，当前阶段过度设计
 
 ---
 
@@ -1270,6 +1296,9 @@ created → searching → downloading → parsing → ingesting → completed
 4. MTEB Leaderboard (Hugging Face) — Embedding 模型标准评测
 5. MinerU 文档 (OpenDataLab) — PDF 解析部署要求
 6. BGE-M3 技术报告 (BAAI) — 三合一检索架构
+7. Langfuse 官方文档 (https://langfuse.com) — LLM 可观测性平台
+8. OpenEvals GitHub (https://github.com/langchain-ai/openevals) — 评估框架
+9. DeepEval GitHub (https://github.com/confident-ai/deepeval) — 备选评估框架
 
 ### C. 术语表
 
@@ -1284,6 +1313,10 @@ created → searching → downloading → parsing → ingesting → completed
 | **SGLang** | 高性能 LLM 推理引擎，支持 RadixAttention |
 | **C-MTEB** | Chinese Massive Text Embedding Benchmark |
 | **NDCG** | Normalized Discounted Cumulative Gain |
+| **FTS5** | Full Text Search 5，SQLite 全文检索引擎 |
+| **Langfuse** | 开源 LLM 可观测性平台，提供 Tracing、成本追踪、Prompt 管理 |
+| **OpenEvals** | LangChain 推出的 LLM 评估框架，TypeScript + Python |
+| **DeepEval** | Confident AI 推出的全功能 LLM 评估框架 |
 
 ---
 
