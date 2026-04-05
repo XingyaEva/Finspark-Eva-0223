@@ -844,19 +844,36 @@ export function createAutoSyncService(
 
       // ==================== Step: ingesting → completed (分阶段) ====================
       // 
-      // Phase 1 (progress 60-75): 下载 markdown + 创建文档 + 分块存储(无 embedding)
-      // Phase 2 (progress 76-95): 每次 advance 嵌入一批 chunks
-      // Phase 3 (progress 96-100): 更新文档状态 + BM25 索引 → completed
+      // Phase 1a (progress 60→68): 下载 ZIP/markdown，清理，存入 KV
+      // Phase 1b (progress 68→76): 从 KV 读取 markdown，分块存储到 D1 (无 embedding)
+      // Phase 2  (progress 76→95): 每次 advance 嵌入一批 chunks
+      // Phase 3  (progress 96→100): 更新文档状态 → completed (跳过 BM25，FTS5 triggers 已处理)
       //
       if (status === 'ingesting') {
         const currentProgress = (task.progress as number) || 60;
         const documentId = task.document_id as number;
+        const kvMarkdownKey = `sync:markdown:${taskId}`;
 
-        // ---- Phase 1: 下载 + 分块 (无 embedding) ----
-        if (currentProgress < 76) {
+        // ---- Phase 1a: 下载 + 清理 → 存入 KV ----
+        if (currentProgress < 68) {
           const mineruResultUrl = (task.mineru_result_url as string) || '';
           if (!mineruResultUrl) {
             throw new Error('Task in ingesting state but no MinerU result URL');
+          }
+
+          // 检查是否已存完成了 Phase 1a (KV 已有 markdown)
+          const existingMd = await kv.get(kvMarkdownKey);
+          if (existingMd) {
+            console.log(`[AutoSync:advance] Task #${taskId}: markdown already in KV (${existingMd.length} chars), skip to 1b`);
+            await updateSyncTask(taskId, { progress: 68 });
+            return {
+              taskId,
+              previousStatus: 'ingesting',
+              currentStatus: 'ingesting',
+              progress: 68,
+              action: `markdown_cached (${existingMd.length} chars)`,
+              needsMoreAdvance: true,
+            };
           }
 
           // 下载 markdown
@@ -866,19 +883,33 @@ export function createAutoSyncService(
             throw new Error('MinerU 解析结果为空');
           }
 
-          // 清理 + 分块
-          const { cleanMineruMarkdown, extractStructuredBlocks } = await import('./ragPdfParser');
-          const { splitTextIntoChunks } = await import('./rag');
+          // 清理 markdown
+          const { cleanMineruMarkdown } = await import('./ragPdfParser');
           const cleanedMarkdown = cleanMineruMarkdown(markdown);
-          const structuredBlocks = extractStructuredBlocks(cleanedMarkdown);
+          console.log(`[AutoSync:advance] Task #${taskId}: raw=${markdown.length} cleaned=${cleanedMarkdown.length} chars`);
 
+          // 存入 KV (Workers KV 单值限制 25 MB，markdown 通常 < 5 MB)
+          await kv.put(kvMarkdownKey, cleanedMarkdown, { expirationTtl: 86400 }); // 24h TTL
+
+          await updateSyncTask(taskId, { progress: 68 });
+          return {
+            taskId,
+            previousStatus: 'ingesting',
+            currentStatus: 'ingesting',
+            progress: 68,
+            action: `markdown_downloaded (${cleanedMarkdown.length} chars → KV)`,
+            needsMoreAdvance: true,
+          };
+        }
+
+        // ---- Phase 1b: 从 KV 读取 markdown → 分块 → 存入 D1 ----
+        if (currentProgress >= 68 && currentProgress < 76) {
           const reportTypeLabel = reportType === 'annual' ? '年报' : reportType === 'semi_annual' ? '半年报' : reportType === 'q1' ? '一季报' : '三季报';
           const docTitle = `${task.stock_name || stockCode} ${reportYear}年${reportTypeLabel}`;
 
           // 创建文档记录（或复用已有的 processing 文档）
           let docId = documentId;
           if (!docId) {
-            // 检查是否已存在 processing 状态的文档
             const existingDoc = await db.prepare(
               `SELECT id FROM rag_documents WHERE stock_code = ? AND title LIKE ? AND status = 'processing' ORDER BY id DESC LIMIT 1`
             ).bind(stockCode, `%${reportYear}%${reportTypeLabel}%`).first<{ id: number }>();
@@ -890,9 +921,9 @@ export function createAutoSyncService(
               const embeddingModelName = `vectorengine/text-embedding-3-small`;
               const docResult = await db.prepare(`
                 INSERT INTO rag_documents (title, file_name, file_type, file_size, stock_code, stock_name, category, tags, embedding_model, status)
-                VALUES (?, ?, 'pdf', ?, ?, ?, ?, ?, ?, 'processing')
+                VALUES (?, ?, 'pdf', 0, ?, ?, ?, ?, ?, 'processing')
               `).bind(
-                docTitle, `${stockCode}_${reportYear}_${reportType}.pdf`, cleanedMarkdown.length,
+                docTitle, `${stockCode}_${reportYear}_${reportType}.pdf`,
                 stockCode, task.stock_name || null,
                 reportType === 'annual' ? 'annual_report' : 'quarterly_report',
                 JSON.stringify([reportType, String(reportYear), stockCode]),
@@ -909,7 +940,6 @@ export function createAutoSyncService(
           ).bind(docId).first<{ cnt: number }>();
           
           if ((existingChunks?.cnt || 0) > 0) {
-            // 已有 chunks，跳过 Phase 1，直接到 Phase 2
             const totalChunks = existingChunks?.cnt || 0;
             await updateSyncTask(taskId, { progress: 76, documentId: docId, chunkCount: totalChunks });
             return {
@@ -922,16 +952,33 @@ export function createAutoSyncService(
             };
           }
 
+          // 从 KV 读取已清理的 markdown
+          const cleanedMarkdown = await kv.get(kvMarkdownKey);
+          if (!cleanedMarkdown) {
+            // KV 缓存丢失，回退到 Phase 1a
+            await updateSyncTask(taskId, { progress: 60 });
+            return {
+              taskId,
+              previousStatus: 'ingesting',
+              currentStatus: 'ingesting',
+              progress: 60,
+              action: 'kv_markdown_missing, reset to phase 1a',
+              needsMoreAdvance: true,
+            };
+          }
+
           // 分块（使用结构感知）
+          const { extractStructuredBlocks } = await import('./ragPdfParser');
+          const { splitTextIntoChunks } = await import('./rag');
+          const structuredBlocks = extractStructuredBlocks(cleanedMarkdown);
+
           const chunks: Array<{ text: string; meta: Record<string, any> }> = [];
           for (const block of structuredBlocks) {
             if (block.type === 'heading') continue;
-            
             const blockContent = block.content.trim();
             if (!blockContent) continue;
 
             if (block.type === 'table') {
-              // 表格作为整块
               chunks.push({
                 text: blockContent,
                 meta: {
@@ -944,7 +991,6 @@ export function createAutoSyncService(
                 },
               });
             } else {
-              // 文本按大小切分
               const subChunks = splitTextIntoChunks(blockContent, { chunkSize: 500, chunkOverlap: 100 });
               for (const sc of subChunks) {
                 chunks.push({
@@ -982,6 +1028,9 @@ export function createAutoSyncService(
             });
             await db.batch(stmts);
           }
+
+          // 清理 KV 缓存
+          await kv.delete(kvMarkdownKey);
 
           await updateSyncTask(taskId, {
             progress: 76,
@@ -1077,7 +1126,8 @@ export function createAutoSyncService(
           };
         }
 
-        // ---- Phase 3: 收尾 — 更新文档状态 + BM25 ----
+        // ---- Phase 3: 收尾 — 更新文档状态 → completed ----
+        // 注意：跳过 BM25 手动构建，因为 FTS5 triggers (migration 0033) 已在 INSERT 时自动维护全文索引
         if (currentProgress >= 96) {
           if (!documentId) {
             throw new Error('No document ID for finalization phase');
@@ -1094,13 +1144,12 @@ export function createAutoSyncService(
             UPDATE rag_documents SET status = 'completed', chunk_count = ?, updated_at = datetime('now') WHERE id = ?
           `).bind(finalChunkCount, documentId).run();
 
-          // BM25 索引
-          try {
-            await services.bm25Service.buildIndexForDocument(documentId);
-            console.log(`[AutoSync:advance] Task #${taskId}: BM25 index built for doc ${documentId}`);
-          } catch (bm25Err) {
-            console.warn(`[AutoSync:advance] Task #${taskId}: BM25 index failed (non-fatal):`, bm25Err);
-          }
+          // 更新文件大小（如果之前是 0）
+          await db.prepare(`
+            UPDATE rag_documents SET file_size = (
+              SELECT COALESCE(SUM(content_length), 0) FROM rag_chunks WHERE document_id = ?
+            ) WHERE id = ? AND file_size = 0
+          `).bind(documentId, documentId).run();
 
           await updateSyncTask(taskId, {
             status: 'completed',
