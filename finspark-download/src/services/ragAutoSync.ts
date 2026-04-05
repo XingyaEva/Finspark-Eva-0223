@@ -110,8 +110,10 @@ export const DEFAULT_SYNC_CONFIG: AutoSyncConfig = {
 export function createAutoSyncService(
   db: D1Database,
   kv: KVNamespace,
-  /** VectorEngine API Key */
+  /** VectorEngine API Key (用于 MinerU/其他服务) */
   apiKey: string,
+  /** DashScope API Key (用于 text-embedding-v4 中文优化向量化) */
+  dashscopeApiKey?: string,
 ) {
   /**
    * 检查指定股票的数据状态
@@ -918,7 +920,7 @@ export function createAutoSyncService(
               docId = existingDoc.id;
               console.log(`[AutoSync:advance] Task #${taskId}: reusing existing doc ${docId}`);
             } else {
-              const embeddingModelName = `vectorengine/text-embedding-3-small`;
+              const embeddingModelName = dashscopeApiKey ? 'dashscope/text-embedding-v4' : 'vectorengine/text-embedding-3-small';
               const docResult = await db.prepare(`
                 INSERT INTO rag_documents (title, file_name, file_type, file_size, stock_code, stock_name, category, tags, embedding_model, status)
                 VALUES (?, ?, 'pdf', 0, ?, ?, ?, ?, ?, 'processing')
@@ -1077,9 +1079,10 @@ export function createAutoSyncService(
             };
           }
 
-          // 生成 embeddings
+          // 生成 embeddings（优先使用 DashScope text-embedding-v4 中文优化模型）
           const { generateEmbeddings, createEmbeddingConfig } = await import('./rag');
           const embeddingConfig = createEmbeddingConfig({
+            dashscopeApiKey: dashscopeApiKey,
             vectorengineApiKey: apiKey,
           });
 
