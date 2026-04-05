@@ -903,8 +903,24 @@ export function createAutoSyncService(
             }
           }
 
-          // 清除旧 chunks（防止重复）
-          await db.prepare('DELETE FROM rag_chunks WHERE document_id = ?').bind(docId).run();
+          // 检查是否已有 chunks（防止重复入库）
+          const existingChunks = await db.prepare(
+            'SELECT COUNT(*) as cnt FROM rag_chunks WHERE document_id = ?'
+          ).bind(docId).first<{ cnt: number }>();
+          
+          if ((existingChunks?.cnt || 0) > 0) {
+            // 已有 chunks，跳过 Phase 1，直接到 Phase 2
+            const totalChunks = existingChunks?.cnt || 0;
+            await updateSyncTask(taskId, { progress: 76, documentId: docId, chunkCount: totalChunks });
+            return {
+              taskId,
+              previousStatus: 'ingesting',
+              currentStatus: 'ingesting',
+              progress: 76,
+              action: `chunks_already_exist (docId=${docId}, chunks=${totalChunks}), skip to embedding`,
+              needsMoreAdvance: true,
+            };
+          }
 
           // 分块（使用结构感知）
           const chunks: Array<{ text: string; meta: Record<string, any> }> = [];
