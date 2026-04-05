@@ -101,7 +101,8 @@ function createPipelineServiceFromEnv(env: Bindings) {
   const intentLlmConfig = gpuProvider.getLlmConfig('intent');
   const intentService = createIntentService(intentLlmConfig.apiKey, intentLlmConfig.baseUrl, intentLlmConfig.model, intentLlmConfig.extraHeaders);
   
-  const autoSyncService = createAutoSyncService(env.DB, env.CACHE, apiKey);
+  const dashscopeApiKey = env.DASHSCOPE_API_KEY;
+  const autoSyncService = createAutoSyncService(env.DB, env.CACHE, apiKey, dashscopeApiKey);
   const fts5Service = createFTS5Service(env.DB);
 
   return createPipelineService(env.DB, env.CACHE, ragService, bm25Service, intentService, apiKey, autoSyncService, gpuProvider, fts5Service);
@@ -1698,7 +1699,8 @@ rag.get('/pipeline/tasks', async (c) => {
 function createAutoSyncServiceFromEnv(env: Bindings) {
   const apiKey = env.VECTORENGINE_API_KEY;
   if (!apiKey) throw new Error('VECTORENGINE_API_KEY not configured');
-  return createAutoSyncService(env.DB, env.CACHE, apiKey);
+  const dashscopeApiKey = env.DASHSCOPE_API_KEY;
+  return createAutoSyncService(env.DB, env.CACHE, apiKey, dashscopeApiKey);
 }
 
 /**
