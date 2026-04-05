@@ -842,72 +842,267 @@ export function createAutoSyncService(
         };
       }
 
-      // ==================== Step: ingesting → completed ====================
+      // ==================== Step: ingesting → completed (分阶段) ====================
+      // 
+      // Phase 1 (progress 60-75): 下载 markdown + 创建文档 + 分块存储(无 embedding)
+      // Phase 2 (progress 76-95): 每次 advance 嵌入一批 chunks
+      // Phase 3 (progress 96-100): 更新文档状态 + BM25 索引 → completed
+      //
       if (status === 'ingesting') {
-        const mineruResultUrl = (task.mineru_result_url as string) || '';
+        const currentProgress = (task.progress as number) || 60;
+        const documentId = task.document_id as number;
 
-        if (!mineruResultUrl) {
-          throw new Error('Task in ingesting state but no MinerU result URL');
+        // ---- Phase 1: 下载 + 分块 (无 embedding) ----
+        if (currentProgress < 76) {
+          const mineruResultUrl = (task.mineru_result_url as string) || '';
+          if (!mineruResultUrl) {
+            throw new Error('Task in ingesting state but no MinerU result URL');
+          }
+
+          // 下载 markdown
+          console.log(`[AutoSync:advance] Task #${taskId}: downloading markdown from ${mineruResultUrl}`);
+          const markdown = await services.pdfParser.downloadMarkdown(mineruResultUrl);
+          if (!markdown || markdown.trim().length === 0) {
+            throw new Error('MinerU 解析结果为空');
+          }
+
+          // 清理 + 分块
+          const { cleanMineruMarkdown, extractStructuredBlocks } = await import('./ragPdfParser');
+          const { splitTextIntoChunks } = await import('./rag');
+          const cleanedMarkdown = cleanMineruMarkdown(markdown);
+          const structuredBlocks = extractStructuredBlocks(cleanedMarkdown);
+
+          const reportTypeLabel = reportType === 'annual' ? '年报' : reportType === 'semi_annual' ? '半年报' : reportType === 'q1' ? '一季报' : '三季报';
+          const docTitle = `${task.stock_name || stockCode} ${reportYear}年${reportTypeLabel}`;
+
+          // 创建文档记录（或复用已有的 processing 文档）
+          let docId = documentId;
+          if (!docId) {
+            // 检查是否已存在 processing 状态的文档
+            const existingDoc = await db.prepare(
+              `SELECT id FROM rag_documents WHERE stock_code = ? AND title LIKE ? AND status = 'processing' ORDER BY id DESC LIMIT 1`
+            ).bind(stockCode, `%${reportYear}%${reportTypeLabel}%`).first<{ id: number }>();
+            
+            if (existingDoc) {
+              docId = existingDoc.id;
+              console.log(`[AutoSync:advance] Task #${taskId}: reusing existing doc ${docId}`);
+            } else {
+              const embeddingModelName = `vectorengine/text-embedding-3-small`;
+              const docResult = await db.prepare(`
+                INSERT INTO rag_documents (title, file_name, file_type, file_size, stock_code, stock_name, category, tags, embedding_model, status)
+                VALUES (?, ?, 'pdf', ?, ?, ?, ?, ?, ?, 'processing')
+              `).bind(
+                docTitle, `${stockCode}_${reportYear}_${reportType}.pdf`, cleanedMarkdown.length,
+                stockCode, task.stock_name || null,
+                reportType === 'annual' ? 'annual_report' : 'quarterly_report',
+                JSON.stringify([reportType, String(reportYear), stockCode]),
+                embeddingModelName
+              ).run();
+              docId = docResult.meta.last_row_id as number;
+              console.log(`[AutoSync:advance] Task #${taskId}: created doc ${docId}`);
+            }
+          }
+
+          // 清除旧 chunks（防止重复）
+          await db.prepare('DELETE FROM rag_chunks WHERE document_id = ?').bind(docId).run();
+
+          // 分块（使用结构感知）
+          const chunks: Array<{ text: string; meta: Record<string, any> }> = [];
+          for (const block of structuredBlocks) {
+            if (block.type === 'heading') continue;
+            
+            const blockContent = block.content.trim();
+            if (!blockContent) continue;
+
+            if (block.type === 'table') {
+              // 表格作为整块
+              chunks.push({
+                text: blockContent,
+                meta: {
+                  chunkType: 'table',
+                  heading: block.heading,
+                  pageStart: block.pageStart,
+                  pageEnd: block.pageEnd,
+                  tableCaption: block.tableCaption,
+                  tableIndex: block.tableIndex,
+                },
+              });
+            } else {
+              // 文本按大小切分
+              const subChunks = splitTextIntoChunks(blockContent, { chunkSize: 500, chunkOverlap: 100 });
+              for (const sc of subChunks) {
+                chunks.push({
+                  text: sc,
+                  meta: {
+                    chunkType: 'text',
+                    heading: block.heading,
+                    pageStart: block.pageStart,
+                    pageEnd: block.pageEnd,
+                  },
+                });
+              }
+            }
+          }
+
+          console.log(`[AutoSync:advance] Task #${taskId}: storing ${chunks.length} chunks (no embeddings)`);
+
+          // 批量写入 D1（不含 embedding，后续 phase 2 补充）
+          const BATCH = 50;
+          for (let i = 0; i < chunks.length; i += BATCH) {
+            const batch = chunks.slice(i, i + BATCH);
+            const stmts = batch.map((c, idx) => {
+              const chunkIdx = i + idx;
+              const pageRange = c.meta.pageStart
+                ? (c.meta.pageEnd && c.meta.pageEnd !== c.meta.pageStart
+                  ? `${c.meta.pageStart}-${c.meta.pageEnd}` : `${c.meta.pageStart}`)
+                : null;
+              return db.prepare(`
+                INSERT INTO rag_chunks (document_id, chunk_index, content, content_length, embedding_key, has_embedding, metadata, chunk_type, page_range)
+                VALUES (?, ?, ?, ?, '', 0, ?, ?, ?)
+              `).bind(
+                docId, chunkIdx, c.text, c.text.length,
+                JSON.stringify(c.meta), c.meta.chunkType || 'text', pageRange
+              );
+            });
+            await db.batch(stmts);
+          }
+
+          await updateSyncTask(taskId, {
+            progress: 76,
+            documentId: docId,
+            chunkCount: chunks.length,
+          });
+
+          return {
+            taskId,
+            previousStatus: 'ingesting',
+            currentStatus: 'ingesting',
+            progress: 76,
+            action: `chunks_stored (docId=${docId}, chunks=${chunks.length}, no_embeddings_yet)`,
+            needsMoreAdvance: true,
+          };
         }
 
-        // 下载 markdown
-        console.log(`[AutoSync:advance] Task #${taskId}: downloading markdown from ${mineruResultUrl}`);
-        const markdown = await services.pdfParser.downloadMarkdown(mineruResultUrl);
+        // ---- Phase 2: 逐批嵌入 ----
+        if (currentProgress >= 76 && currentProgress < 96) {
+          if (!documentId) {
+            throw new Error('No document ID for embedding phase');
+          }
 
-        if (!markdown || markdown.trim().length === 0) {
-          throw new Error('MinerU 解析结果为空');
+          // 找到下一批未嵌入的 chunks
+          const EMBED_BATCH = 20;
+          const unembeddedChunks = await db.prepare(
+            `SELECT id, chunk_index, content FROM rag_chunks 
+             WHERE document_id = ? AND has_embedding = 0 
+             ORDER BY chunk_index LIMIT ?`
+          ).bind(documentId, EMBED_BATCH).all();
+
+          const chunksToEmbed = unembeddedChunks.results || [];
+          
+          if (chunksToEmbed.length === 0) {
+            // 所有 chunks 已嵌入，进入 phase 3
+            await updateSyncTask(taskId, { progress: 96 });
+            return {
+              taskId,
+              previousStatus: 'ingesting',
+              currentStatus: 'ingesting',
+              progress: 96,
+              action: 'all_chunks_embedded',
+              needsMoreAdvance: true,
+            };
+          }
+
+          // 生成 embeddings
+          const { generateEmbeddings, createEmbeddingConfig } = await import('./rag');
+          const embeddingConfig = createEmbeddingConfig({
+            vectorengineApiKey: apiKey,
+          });
+
+          const texts = chunksToEmbed.map(c => c.content as string);
+          const embeddings = await generateEmbeddings(texts, embeddingConfig);
+
+          // 存储 embeddings 到 KV + 更新 D1
+          const updateStmts: D1PreparedStatement[] = [];
+          for (let i = 0; i < chunksToEmbed.length; i++) {
+            const chunk = chunksToEmbed[i];
+            const chunkIndex = chunk.chunk_index as number;
+            const embeddingKey = `rag:emb:${documentId}:${chunkIndex}`;
+            
+            await kv.put(embeddingKey, JSON.stringify(embeddings[i]));
+            
+            updateStmts.push(
+              db.prepare(
+                `UPDATE rag_chunks SET embedding_key = ?, has_embedding = 1 WHERE id = ?`
+              ).bind(embeddingKey, chunk.id)
+            );
+          }
+          
+          if (updateStmts.length > 0) {
+            await db.batch(updateStmts);
+          }
+
+          // 计算进度：76 + (已嵌入/总数) * 20
+          const totalChunks = (task.chunk_count as number) || 1;
+          const embeddedCountResult = await db.prepare(
+            `SELECT COUNT(*) as cnt FROM rag_chunks WHERE document_id = ? AND has_embedding = 1`
+          ).bind(documentId).first<{ cnt: number }>();
+          const embeddedCount = embeddedCountResult?.cnt || 0;
+          const embeddingProgress = Math.min(76 + Math.floor((embeddedCount / totalChunks) * 20), 95);
+
+          await updateSyncTask(taskId, { progress: embeddingProgress });
+
+          return {
+            taskId,
+            previousStatus: 'ingesting',
+            currentStatus: 'ingesting',
+            progress: embeddingProgress,
+            action: `embedded_batch (${embeddedCount}/${totalChunks} chunks done)`,
+            needsMoreAdvance: true,
+          };
         }
 
-        await updateSyncTask(taskId, { progress: 70 });
+        // ---- Phase 3: 收尾 — 更新文档状态 + BM25 ----
+        if (currentProgress >= 96) {
+          if (!documentId) {
+            throw new Error('No document ID for finalization phase');
+          }
 
-        // 清理 Markdown 并提取结构化块
-        const { cleanMineruMarkdown, extractStructuredBlocks } = await import('./ragPdfParser');
-        const cleanedMarkdown = cleanMineruMarkdown(markdown);
-        const structuredBlocks = extractStructuredBlocks(cleanedMarkdown);
+          // 获取实际 chunk 数
+          const chunkCountResult = await db.prepare(
+            `SELECT COUNT(*) as cnt FROM rag_chunks WHERE document_id = ? AND has_embedding = 1`
+          ).bind(documentId).first<{ cnt: number }>();
+          const finalChunkCount = chunkCountResult?.cnt || 0;
 
-        await updateSyncTask(taskId, { progress: 75 });
+          // 更新文档状态
+          await db.prepare(`
+            UPDATE rag_documents SET status = 'completed', chunk_count = ?, updated_at = datetime('now') WHERE id = ?
+          `).bind(finalChunkCount, documentId).run();
 
-        // 注入 BM25 回调
-        services.ragService.setBM25BuildCallback(async (docId: number) => {
-          await services.bm25Service.buildIndexForDocument(docId);
-        });
+          // BM25 索引
+          try {
+            await services.bm25Service.buildIndexForDocument(documentId);
+            console.log(`[AutoSync:advance] Task #${taskId}: BM25 index built for doc ${documentId}`);
+          } catch (bm25Err) {
+            console.warn(`[AutoSync:advance] Task #${taskId}: BM25 index failed (non-fatal):`, bm25Err);
+          }
 
-        const reportTypeLabel = reportType === 'annual' ? '年报' : reportType === 'semi_annual' ? '半年报' : reportType === 'q1' ? '一季报' : '三季报';
-        const docTitle = `${task.stock_name || stockCode} ${reportYear}年${reportTypeLabel}`;
+          await updateSyncTask(taskId, {
+            status: 'completed',
+            progress: 100,
+            chunkCount: finalChunkCount,
+          });
 
-        console.log(`[AutoSync:advance] Task #${taskId}: ingesting "${docTitle}" (${cleanedMarkdown.length} chars, ${structuredBlocks.length} blocks)`);
+          console.log(`[AutoSync:advance] Task #${taskId}: COMPLETED → docId=${documentId}, chunks=${finalChunkCount}`);
 
-        const ingestResult = await services.ragService.ingestDocument({
-          title: docTitle,
-          content: cleanedMarkdown,
-          fileName: `${stockCode}_${reportYear}_${reportType}.pdf`,
-          fileType: 'pdf',
-          stockCode: stockCode,
-          stockName: task.stock_name as string || undefined,
-          category: reportType === 'annual' ? 'annual_report' : 'quarterly_report',
-          tags: [reportType, String(reportYear), stockCode],
-          chunkSize: 500,
-          chunkOverlap: 100,
-          structuredBlocks,
-        });
-
-        await updateSyncTask(taskId, {
-          status: 'completed',
-          progress: 100,
-          documentId: ingestResult.documentId,
-          chunkCount: ingestResult.chunkCount,
-        });
-
-        console.log(`[AutoSync:advance] Task #${taskId}: COMPLETED → docId=${ingestResult.documentId}, chunks=${ingestResult.chunkCount}`);
-
-        return {
-          taskId,
-          previousStatus: 'ingesting',
-          currentStatus: 'completed',
-          progress: 100,
-          action: `ingested (docId=${ingestResult.documentId}, chunks=${ingestResult.chunkCount})`,
-          needsMoreAdvance: false,
-        };
+          return {
+            taskId,
+            previousStatus: 'ingesting',
+            currentStatus: 'completed',
+            progress: 100,
+            action: `completed (docId=${documentId}, chunks=${finalChunkCount})`,
+            needsMoreAdvance: false,
+          };
+        }
       }
 
       // 未知状态
