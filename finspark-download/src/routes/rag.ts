@@ -2006,6 +2006,190 @@ rag.post('/sync/ensure', async (c) => {
   }
 });
 
+// ==================== 分步同步推进（Advance Pattern） ====================
+
+/**
+ * POST /sync/advance/:id - 推进单个同步任务一步
+ * 
+ * 状态机模式：每次调用只执行当前状态的下一步
+ * 客户端/脚本循环调用直到 needsMoreAdvance === false
+ * 
+ * 返回: { taskId, previousStatus, currentStatus, progress, action, needsMoreAdvance, error? }
+ */
+rag.post('/sync/advance/:id', async (c) => {
+  const { env } = c;
+
+  try {
+    const taskId = parseInt(c.req.param('id'));
+    if (!taskId) {
+      return c.json({ success: false, error: '无效的任务 ID' }, 400);
+    }
+
+    const mineruApiKey = env.MINERU_API_KEY;
+    if (!mineruApiKey) {
+      return c.json({ success: false, error: 'MINERU_API_KEY 未配置' }, 500);
+    }
+
+    const autoSync = createAutoSyncServiceFromEnv(env);
+    const cninfoService = createCninfoService();
+    const pdfParser = createPdfParserService({ apiKey: mineruApiKey });
+    const ragService = createRAGServiceFromEnv(env);
+    const bm25Service = createBM25ServiceFromEnv(env);
+
+    const result = await autoSync.advanceSyncTask(taskId, {
+      cninfo: cninfoService,
+      pdfParser,
+      ragService,
+      bm25Service,
+    });
+
+    return c.json({ success: true, ...result });
+  } catch (error) {
+    console.error('[RAG Sync Advance Error]', error);
+    return c.json({
+      success: false,
+      error: error instanceof Error ? error.message : '推进同步任务失败',
+    }, 500);
+  }
+});
+
+/**
+ * POST /sync/batch-advance - 批量推进所有活跃任务一步
+ * 
+ * Body: { staleMinutes?: number, resetStale?: boolean, maxTasks?: number }
+ * 
+ * 1. 可选：先重置停滞任务
+ * 2. 对所有非终态任务调用一次 advance
+ * 3. 返回每个任务的推进结果
+ */
+rag.post('/sync/batch-advance', async (c) => {
+  const { env } = c;
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const { staleMinutes = 10, resetStale = false, maxTasks = 20 } = body as any;
+
+    const mineruApiKey = env.MINERU_API_KEY;
+    if (!mineruApiKey) {
+      return c.json({ success: false, error: 'MINERU_API_KEY 未配置' }, 500);
+    }
+
+    const autoSync = createAutoSyncServiceFromEnv(env);
+    const cninfoService = createCninfoService();
+    const pdfParser = createPdfParserService({ apiKey: mineruApiKey });
+    const ragService = createRAGServiceFromEnv(env);
+    const bm25Service = createBM25ServiceFromEnv(env);
+    const services = { cninfo: cninfoService, pdfParser, ragService, bm25Service };
+
+    // 可选：先重置停滞任务
+    let resetResult = null;
+    if (resetStale) {
+      resetResult = await autoSync.resetStaleTasks(staleMinutes);
+    }
+
+    // 获取所有活跃任务
+    const { tasks: activeTasks } = await autoSync.listSyncTasks({
+      limit: maxTasks,
+    });
+
+    const nonTerminalTasks = activeTasks.filter(
+      t => t.status !== 'completed' && t.status !== 'failed'
+    );
+
+    // 逐个推进（不并发，避免超过 Workers CPU 限制）
+    const results = [];
+    for (const task of nonTerminalTasks) {
+      if (!task.id) continue;
+      try {
+        const advResult = await autoSync.advanceSyncTask(task.id, services);
+        results.push(advResult);
+      } catch (err) {
+        results.push({
+          taskId: task.id,
+          previousStatus: task.status,
+          currentStatus: 'failed',
+          progress: task.progress,
+          action: 'advance_error',
+          needsMoreAdvance: false,
+          error: err instanceof Error ? err.message : '推进失败',
+        });
+      }
+    }
+
+    // 统计
+    const summary = {
+      total: nonTerminalTasks.length,
+      advanced: results.filter(r => r.previousStatus !== r.currentStatus).length,
+      completed: results.filter(r => r.currentStatus === 'completed').length,
+      failed: results.filter(r => r.currentStatus === 'failed').length,
+      stillProcessing: results.filter(r => r.needsMoreAdvance).length,
+    };
+
+    return c.json({
+      success: true,
+      summary,
+      resetResult,
+      results,
+    });
+  } catch (error) {
+    console.error('[RAG Sync Batch Advance Error]', error);
+    return c.json({
+      success: false,
+      error: error instanceof Error ? error.message : '批量推进失败',
+    }, 500);
+  }
+});
+
+/**
+ * POST /sync/reset/:id - 重置失败/卡住的任务以便重试
+ */
+rag.post('/sync/reset/:id', async (c) => {
+  const { env } = c;
+
+  try {
+    const taskId = parseInt(c.req.param('id'));
+    if (!taskId) {
+      return c.json({ success: false, error: '无效的任务 ID' }, 400);
+    }
+
+    const autoSync = createAutoSyncServiceFromEnv(env);
+    const result = await autoSync.resetTaskForRetry(taskId);
+
+    return c.json({ ...result });
+  } catch (error) {
+    console.error('[RAG Sync Reset Error]', error);
+    return c.json({
+      success: false,
+      message: error instanceof Error ? error.message : '重置任务失败',
+    }, 500);
+  }
+});
+
+/**
+ * POST /sync/reset-stale - 批量重置停滞任务
+ * 
+ * Body: { staleMinutes?: number } (默认 10 分钟)
+ */
+rag.post('/sync/reset-stale', async (c) => {
+  const { env } = c;
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const { staleMinutes = 10 } = body as any;
+
+    const autoSync = createAutoSyncServiceFromEnv(env);
+    const result = await autoSync.resetStaleTasks(staleMinutes);
+
+    return c.json({ success: true, ...result });
+  } catch (error) {
+    console.error('[RAG Sync Reset Stale Error]', error);
+    return c.json({
+      success: false,
+      error: error instanceof Error ? error.message : '批量重置失败',
+    }, 500);
+  }
+});
+
 // ==================== GPU 服务管理 ====================
 
 /**
