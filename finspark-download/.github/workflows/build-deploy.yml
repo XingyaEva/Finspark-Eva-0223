@@ -8,12 +8,16 @@ on:
       - 'finspark-download/package.json'
       - 'finspark-download/vite.config.ts'
       - 'finspark-download/wrangler.jsonc'
+      - 'finspark-download/migrations/**'
+      - 'finspark-download/scripts/**'
+      - 'finspark-download/.github/workflows/**'
   pull_request:
     branches: [main]
     paths:
       - 'finspark-download/src/**'
       - 'finspark-download/package.json'
       - 'finspark-download/vite.config.ts'
+      - 'finspark-download/migrations/**'
 
 jobs:
   build:
@@ -91,6 +95,14 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Run D1 Migrations
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 migrations apply genspark-financial-db --remote
+          workingDirectory: finspark-download
+
       - name: Deploy to Cloudflare Pages (Preview)
         uses: cloudflare/wrangler-action@v3
         with:
@@ -124,6 +136,14 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Run D1 Migrations
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 migrations apply genspark-financial-db --remote
+          workingDirectory: finspark-download
 
       - name: Deploy to Cloudflare Pages (Production)
         uses: cloudflare/wrangler-action@v3

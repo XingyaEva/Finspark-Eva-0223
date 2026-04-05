@@ -28,17 +28,21 @@
   ],
 
   // Vectorize 向量数据库（RAG 语义检索，替代 KV 全扫方案）
-  // 索引需先通过 wrangler CLI 创建：
+  // 
+  // ⚠️ 启用前必须先通过 wrangler CLI 创建索引，否则部署会报错：
   //   npx wrangler vectorize create finspark-rag-index --dimensions=1024 --metric=cosine
   //   npx wrangler vectorize create-metadata-index finspark-rag-index --property-name=stock_code --type=string
   //   npx wrangler vectorize create-metadata-index finspark-rag-index --property-name=document_id --type=number
   //   npx wrangler vectorize create-metadata-index finspark-rag-index --property-name=category --type=string
-  "vectorize": [
-    {
-      "binding": "VECTORIZE",
-      "index_name": "finspark-rag-index"
-    }
-  ]
+  //
+  // 索引创建完成后，取消下方注释即可启用 Vectorize 加速检索（代码已内置降级逻辑）
+  //
+  // "vectorize": [
+  //   {
+  //     "binding": "VECTORIZE",
+  //     "index_name": "finspark-rag-index"
+  //   }
+  // ]
 
   // 环境变量已在 Cloudflare Dashboard 中配置:
   // - AKSHARE_PROXY_URL: http://47.110.92.210:8000
