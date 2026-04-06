@@ -388,6 +388,8 @@ ragEnhance.post('/evaluations', async (c) => {
         minScore: config.minScore || 0.25,
         enableRerank: config.enableRerank || false,
         rerankWeight: config.rerankWeight || 0.7,
+        contextMode: config.contextMode || 'none',
+        contextWindow: config.contextWindow ?? 1,
       },
       userId: body.userId || undefined,
     });
@@ -426,6 +428,8 @@ ragEnhance.post('/evaluations/:id/run', async (c) => {
           enableRerank: config.enableRerank || false,
           topK: config.topK || 5,
           minScore: config.minScore || 0.25,
+          contextMode: config.contextMode || 'none',
+          contextWindow: config.contextWindow ?? 1,
         },
       });
 
