@@ -623,9 +623,14 @@ ragOps.post('/rechunk/:documentId', async (c) => {
     const kvKey = `rechunk:content:${documentId}`;
 
     // 获取文档信息
-    const doc = await db.prepare(
-      'SELECT id, title, file_name, file_type, stock_code, stock_name, category, tags, status FROM rag_documents WHERE id = ?'
-    ).bind(documentId).first<Record<string, unknown>>();
+    let doc;
+    try {
+      doc = await db.prepare(
+        'SELECT id, title, file_name, file_type, stock_code, stock_name, category, tags, status FROM rag_documents WHERE id = ?'
+      ).bind(documentId).first<Record<string, unknown>>();
+    } catch (docErr) {
+      return c.json({ success: false, error: `Doc query failed: ${docErr instanceof Error ? docErr.message : docErr}` }, 500);
+    }
 
     if (!doc) {
       return c.json({ success: false, error: 'Document not found' }, 404);
@@ -764,14 +769,42 @@ ragOps.post('/rechunk/:documentId', async (c) => {
       const category = doc.category as string || '';
 
       // 重新切片
-      const structuredBlocks = extractStructuredBlocks(fullContent);
-      const newChunks = buildStructuredChunksV2(structuredBlocks, {
-        chunkSize: 800, chunkOverlap: 50, fileName, stockCode, category,
-      });
+      let structuredBlocks;
+      let newChunks;
+      try {
+        structuredBlocks = extractStructuredBlocks(fullContent);
+        newChunks = buildStructuredChunksV2(structuredBlocks, {
+          chunkSize: 800, chunkOverlap: 50, fileName, stockCode, category,
+        });
+        console.log(`[Rechunk] Doc ${documentId}: ${structuredBlocks.length} blocks → ${newChunks.length} chunks`);
+      } catch (chunkErr) {
+        return c.json({ success: false, error: `Chunking failed: ${chunkErr instanceof Error ? chunkErr.message : chunkErr}`, phase: 2 }, 500);
+      }
 
-      // 删除旧 chunks（不删 KV embeddings — 太慢，让它们自然过期或后续清理）
-      await db.prepare('DELETE FROM rag_chunks WHERE document_id = ?').bind(documentId).run();
-      console.log(`[Rechunk] Deleted old chunks for doc ${documentId}`);
+      // 删除旧 chunks
+      // 注意：FTS5 触发器可能导致 DELETE 失败（索引不同步），所以先禁用触发器
+      try {
+        // 先删除 FTS5 触发器（避免 DELETE 时 FTS5 索引不同步报错）
+        await db.batch([
+          db.prepare('DROP TRIGGER IF EXISTS rag_chunks_fts_delete'),
+          db.prepare('DROP TRIGGER IF EXISTS rag_chunks_fts_insert'),
+          db.prepare('DROP TRIGGER IF EXISTS rag_chunks_fts_update'),
+        ]);
+        console.log(`[Rechunk] FTS5 triggers dropped for doc ${documentId}`);
+
+        await db.prepare('DELETE FROM rag_chunks WHERE document_id = ?').bind(documentId).run();
+        console.log(`[Rechunk] Deleted old chunks for doc ${documentId}`);
+      } catch (delErr) {
+        // 即使失败也尝试重建触发器
+        try {
+          await db.batch([
+            db.prepare(`CREATE TRIGGER IF NOT EXISTS rag_chunks_fts_insert AFTER INSERT ON rag_chunks BEGIN INSERT INTO rag_chunks_fts(rowid, content) VALUES (NEW.id, NEW.content); END`),
+            db.prepare(`CREATE TRIGGER IF NOT EXISTS rag_chunks_fts_delete AFTER DELETE ON rag_chunks BEGIN INSERT INTO rag_chunks_fts(rag_chunks_fts, rowid, content) VALUES ('delete', OLD.id, OLD.content); END`),
+            db.prepare(`CREATE TRIGGER IF NOT EXISTS rag_chunks_fts_update AFTER UPDATE OF content ON rag_chunks BEGIN INSERT INTO rag_chunks_fts(rag_chunks_fts, rowid, content) VALUES ('delete', OLD.id, OLD.content); INSERT INTO rag_chunks_fts(rowid, content) VALUES (NEW.id, NEW.content); END`),
+          ]);
+        } catch {}
+        return c.json({ success: false, error: `Delete failed: ${delErr instanceof Error ? delErr.message : delErr}`, phase: 2 }, 500);
+      }
 
       // 写入新 chunks（不含 embedding）
       // 使用较小的批次（10条/批）避免 D1 payload 限制（表格 HTML 可能很大）
@@ -811,6 +844,28 @@ ragOps.post('/rechunk/:documentId', async (c) => {
             }
           }
         }
+      }
+
+      // 重建 FTS5：清空 → 回填 → 重建触发器
+      try {
+        // 清空旧 FTS5 数据
+        await db.prepare("DELETE FROM rag_chunks_fts").run();
+        // 回填所有 chunks 到 FTS5
+        await db.prepare(`
+          INSERT INTO rag_chunks_fts(rowid, content)
+          SELECT id, content FROM rag_chunks
+        `).run();
+        // 重建触发器
+        await db.batch([
+          db.prepare(`CREATE TRIGGER IF NOT EXISTS rag_chunks_fts_insert AFTER INSERT ON rag_chunks BEGIN INSERT INTO rag_chunks_fts(rowid, content) VALUES (NEW.id, NEW.content); END`),
+          db.prepare(`CREATE TRIGGER IF NOT EXISTS rag_chunks_fts_delete AFTER DELETE ON rag_chunks BEGIN INSERT INTO rag_chunks_fts(rag_chunks_fts, rowid, content) VALUES ('delete', OLD.id, OLD.content); END`),
+          db.prepare(`CREATE TRIGGER IF NOT EXISTS rag_chunks_fts_update AFTER UPDATE OF content ON rag_chunks BEGIN INSERT INTO rag_chunks_fts(rag_chunks_fts, rowid, content) VALUES ('delete', OLD.id, OLD.content); INSERT INTO rag_chunks_fts(rowid, content) VALUES (NEW.id, NEW.content); END`),
+        ]);
+        // 优化 FTS5
+        await db.prepare("INSERT INTO rag_chunks_fts(rag_chunks_fts) VALUES ('optimize')").run();
+        console.log(`[Rechunk] FTS5 rebuilt and triggers recreated`);
+      } catch (ftsErr) {
+        console.warn(`[Rechunk] Warning: FTS5 rebuild failed (non-critical):`, ftsErr);
       }
 
       // 更新文档 chunk_count
