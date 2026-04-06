@@ -313,6 +313,209 @@ function recursiveSplit(text: string, separators: string[], config: ChunkConfig)
 // 支持多 Provider：DashScope (通义千问 text-embedding-v4) / VectorEngine (OpenAI text-embedding-3-small)
 // 两者都兼容 OpenAI Embedding API 格式，仅 base URL / model / dimensions 不同
 
+// ==================== 独立的结构化分块函数 ====================
+// 供 ragAutoSync.ts 等外部模块直接调用（不依赖 RAGService 实例）
+
+/**
+ * 从 HTML 表格中提取纯文本摘要（用于 embedding）
+ * 与 RAGService.extractTablePlainText 逻辑一致
+ */
+function extractTablePlainTextStandalone(html: string, caption?: string): string {
+  let text = html
+    .replace(/<\/?(?:table|thead|tbody|tfoot|tr)\s*>/gi, '\n')
+    .replace(/<(?:td|th)[^>]*>/gi, ' | ')
+    .replace(/<\/(?:td|th)\s*>/gi, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\s*\|\s*\|\s*/g, ' | ')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+
+  if (caption) {
+    text = `[表格: ${caption}]\n${text}`;
+  }
+  if (text.length > 2000) {
+    text = text.slice(0, 2000) + '...(表格内容过长已截断)';
+  }
+  return text;
+}
+
+/**
+ * 句子边界优先切分（独立版）
+ * 在中文句号、感叹号、问号处优先切分，保证 chunk 不在句中截断
+ */
+function splitBySentenceBoundaryStandalone(text: string, maxSize: number, overlap: number): string[] {
+  const sentenceEnders = /([。！？；\n\n])/g;
+  const sentences: string[] = [];
+  let lastIdx = 0;
+
+  let match;
+  while ((match = sentenceEnders.exec(text)) !== null) {
+    const end = match.index + match[0].length;
+    const sentence = text.slice(lastIdx, end);
+    if (sentence.trim()) {
+      sentences.push(sentence);
+    }
+    lastIdx = end;
+  }
+  if (lastIdx < text.length) {
+    const remaining = text.slice(lastIdx).trim();
+    if (remaining) sentences.push(remaining);
+  }
+
+  if (sentences.length === 0) return [text];
+
+  const chunks: string[] = [];
+  let current = '';
+
+  for (const sentence of sentences) {
+    if (current.length + sentence.length <= maxSize) {
+      current += sentence;
+    } else {
+      if (current.trim()) {
+        chunks.push(current.trim());
+      }
+      if (sentence.length > maxSize) {
+        const subChunks = splitTextIntoChunks(sentence, { chunkSize: maxSize, chunkOverlap: overlap });
+        chunks.push(...subChunks);
+        current = '';
+      } else {
+        if (overlap > 0 && chunks.length > 0) {
+          const lastChunk = chunks[chunks.length - 1];
+          const overlapText = lastChunk.slice(-Math.min(overlap, lastChunk.length));
+          current = overlapText + sentence;
+        } else {
+          current = sentence;
+        }
+      }
+    }
+  }
+
+  if (current.trim()) {
+    chunks.push(current.trim());
+  }
+
+  return chunks.length > 0 ? chunks : [text];
+}
+
+/**
+ * 结构化分块 V2 — 独立导出版
+ * 
+ * 供 ragAutoSync.ts 等外部模块使用，逻辑与 RAGService.buildStructuredChunks 保持一致：
+ * - 表格：完整保留 HTML + 生成纯文本摘要 chunk
+ * - 文本：句子边界切分（800-1200 字），碎片合并（<100 字）
+ * - Parent-child 章节追踪
+ * - heading/page/section metadata
+ */
+export function buildStructuredChunksV2(
+  blocks: import('../services/ragPdfParser').StructuredBlock[],
+  opts: { chunkSize?: number; chunkOverlap?: number; fileName?: string; stockCode?: string; category?: string } = {}
+): Array<{ text: string; meta: ChunkMetadata }> {
+  const result: Array<{ text: string; meta: ChunkMetadata }> = [];
+  const totalBlocks = blocks.length;
+
+  // P1: 使用更大的窗口进行句子边界切分
+  const effectiveChunkSize = Math.max(opts.chunkSize || 800, 800);
+  const effectiveOverlap = Math.max(opts.chunkOverlap || 50, 50);
+
+  // 追踪当前章节
+  let currentSectionStart = 0;
+
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i];
+    const baseMeta: ChunkMetadata = {
+      chunkType: block.type,
+      pageStart: block.pageStart,
+      pageEnd: block.pageEnd,
+      heading: block.heading,
+      headingLevel: block.headingLevel,
+      sourceFile: opts.fileName,
+      stockCode: opts.stockCode,
+      category: opts.category,
+      positionRatio: totalBlocks > 1 ? i / (totalBlocks - 1) : 0,
+    };
+
+    if (block.type === 'table') {
+      // 表格块：整块保留 + 生成纯文本摘要
+      result.push({
+        text: block.content,
+        meta: {
+          ...baseMeta,
+          tableIndex: block.tableIndex,
+          tableCaption: block.tableCaption,
+        },
+      });
+
+      const tablePlainText = extractTablePlainTextStandalone(block.content, block.tableCaption);
+      if (tablePlainText.length > 20) {
+        result.push({
+          text: tablePlainText,
+          meta: {
+            ...baseMeta,
+            chunkType: 'text',
+            tableIndex: block.tableIndex,
+            tableCaption: block.tableCaption,
+          },
+        });
+      }
+
+    } else if (block.type === 'heading') {
+      // heading 块：记录章节变更
+      if ((block.headingLevel || 0) <= 2) {
+        currentSectionStart = result.length;
+      }
+      if (block.content.length > 30) {
+        result.push({ text: block.content, meta: { ...baseMeta, chunkType: 'text' } });
+      }
+
+    } else {
+      // text 块：句子边界切分
+      if (block.content.length <= effectiveChunkSize) {
+        result.push({ text: block.content, meta: baseMeta });
+      } else {
+        const subChunks = splitBySentenceBoundaryStandalone(block.content, effectiveChunkSize, effectiveOverlap);
+        for (const sub of subChunks) {
+          result.push({ text: sub, meta: { ...baseMeta } });
+        }
+      }
+    }
+  }
+
+  // P1: 碎片合并 — 将 <100 字的短 chunk 合并到前一个 chunk
+  const MIN_CHUNK_SIZE = 100;
+  const merged: Array<{ text: string; meta: ChunkMetadata }> = [];
+  for (const item of result) {
+    if (item.text.length < MIN_CHUNK_SIZE && merged.length > 0) {
+      const prev = merged[merged.length - 1];
+      if (prev.meta.chunkType === 'text' && item.meta.chunkType === 'text'
+          && (prev.text.length + item.text.length) < effectiveChunkSize * 1.5) {
+        prev.text += '\n' + item.text;
+        if (item.meta.pageEnd && item.meta.pageEnd > (prev.meta.pageEnd || 0)) {
+          prev.meta.pageEnd = item.meta.pageEnd;
+        }
+        continue;
+      }
+    }
+    merged.push(item);
+  }
+
+  // P2: 为每个 child chunk 标记 parent_section_id
+  let sectionStartIdx = 0;
+  for (let j = 0; j < merged.length; j++) {
+    const meta = merged[j].meta;
+    if (meta.headingLevel && meta.headingLevel <= 2 && meta.chunkType !== 'text') {
+      sectionStartIdx = j;
+    }
+    meta.parentSectionIdx = sectionStartIdx;
+  }
+
+  console.log(`[StructuredChunksV2:standalone] ${result.length} raw -> ${merged.length} merged ` +
+    `(tables: ${merged.filter(c => c.meta.chunkType === 'table').length}, ` +
+    `text: ${merged.filter(c => c.meta.chunkType === 'text').length}, ` +
+    `avg len: ${Math.round(merged.reduce((s, c) => s + c.text.length, 0) / (merged.length || 1))})`);
+
+  return merged;
+}
+
 /**
  * 生成文本的embedding向量
  * 通过配置的 Provider API (OpenAI兼容格式) 调用embedding模型
