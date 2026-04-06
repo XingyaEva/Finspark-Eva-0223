@@ -942,7 +942,17 @@ ragOps.post('/rechunk/:documentId', async (c) => {
         });
       }
 
-      const batchTexts = unembedded.results.map((r: any) => r.content as string);
+      // DashScope text-embedding-v4 限制 8192 tokens (~6000 中文字符)
+      // 截断超长 chunk 以避免 API 报错
+      const MAX_EMBED_CHARS = 6000;
+      const batchTexts = unembedded.results.map((r: any) => {
+        const content = r.content as string;
+        if (content.length > MAX_EMBED_CHARS) {
+          console.warn(`[Rechunk:embed] Chunk ${r.chunk_index} truncated: ${content.length} → ${MAX_EMBED_CHARS} chars`);
+          return content.slice(0, MAX_EMBED_CHARS);
+        }
+        return content;
+      });
       const embeddings = await generateEmbeddings(batchTexts, embeddingConfig);
 
       const stmts: D1PreparedStatement[] = [];
