@@ -563,24 +563,62 @@ ${chunkTexts}`;
     const evaluation = await this.getEvaluation(evaluationId);
     const config: EvalConfig = JSON.parse(evaluation.config_json);
 
-    // Mark as running
-    await this.db.prepare(
-      "UPDATE rag_evaluations SET status = 'running', started_at = datetime('now') WHERE id = ?"
-    ).bind(evaluationId).run();
+    // Resume support: load already-completed question IDs
+    const existingResults = await this.getEvaluationResults(evaluationId);
+    const completedQuestionIds = new Set(existingResults.map(r => r.question_id));
+
+    // Mark as running (keep existing started_at if resuming)
+    if (completedQuestionIds.size === 0) {
+      await this.db.prepare(
+        "UPDATE rag_evaluations SET status = 'running', started_at = datetime('now') WHERE id = ?"
+      ).bind(evaluationId).run();
+    } else {
+      await this.db.prepare(
+        "UPDATE rag_evaluations SET status = 'running' WHERE id = ?"
+      ).bind(evaluationId).run();
+      console.log(`[Eval] Resuming eval #${evaluationId}, ${completedQuestionIds.size} questions already done`);
+    }
 
     // Fetch all questions
     const { questions } = await this.listQuestions(evaluation.test_set_id, { limit: 500 });
 
-    let completed = 0;
-    let exactMatchCorrect = 0;
+    // Accumulate from existing results first
+    let completed = existingResults.length;
+    let exactMatchCorrect = existingResults.filter(r => r.is_correct === 1).length;
     let semanticScoreSum = 0;
     let recallScoreSum = 0;
     let citationScoreSum = 0;
 
+    // Parse existing scores from scoring_reason
+    for (const r of existingResults) {
+      const reason = r.scoring_reason || '';
+      const semMatch = reason.match(/语义:\s*(\d+)%/);
+      const recMatch = reason.match(/召回:\s*(\d+)%/);
+      const citMatch = reason.match(/引用:\s*(\d+)%/);
+      semanticScoreSum += semMatch ? parseInt(semMatch[1]) : (r.score || 0);
+      recallScoreSum += recMatch ? parseInt(recMatch[1]) : 100;
+      citationScoreSum += citMatch ? parseInt(citMatch[1]) : 0;
+    }
+
     const typeScores: Record<string, { total: number; sum: number }> = {};
     const difficultyScores: Record<string, { total: number; sum: number }> = {};
 
-    for (const q of questions) {
+    // Accumulate type/difficulty from existing results
+    for (const r of existingResults) {
+      const qt = r.question_type || 'unknown';
+      const diff = r.difficulty || 'unknown';
+      if (!typeScores[qt]) typeScores[qt] = { total: 0, sum: 0 };
+      typeScores[qt].total++;
+      typeScores[qt].sum += (r.score || 0);
+      if (!difficultyScores[diff]) difficultyScores[diff] = { total: 0, sum: 0 };
+      difficultyScores[diff].total++;
+      difficultyScores[diff].sum += (r.score || 0);
+    }
+
+    // Process only unanswered questions
+    const pendingQuestions = questions.filter(q => !completedQuestionIds.has(q.id));
+
+    for (const q of pendingQuestions) {
       try {
         // Run RAG query
         const result = await ragQueryFn(q.question, config);
