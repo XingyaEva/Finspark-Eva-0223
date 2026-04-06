@@ -26,6 +26,10 @@ export interface EnhancedRAGConfig {
   rerankWeight: number;         // LLM 重排权重 0-1（默认 0.7）
   documentIds?: number[];
   stockCode?: string;
+
+  // === Context Expansion（上下文扩展） ===
+  contextMode: 'none' | 'adjacent' | 'parent';  // 上下文模式（默认 none = 向后兼容）
+  contextWindow: number;                          // adjacent 模式窗口大小，前后各 N 个 chunk（默认 1）
 }
 
 export const DEFAULT_ENHANCED_CONFIG: EnhancedRAGConfig = {
@@ -34,7 +38,24 @@ export const DEFAULT_ENHANCED_CONFIG: EnhancedRAGConfig = {
   topK: 5,
   minScore: 0.25,
   rerankWeight: 0.7,
+  contextMode: 'none',          // 默认关闭上下文扩展（向后兼容）
+  contextWindow: 1,             // adjacent 模式默认前后各 1 个 chunk
 };
+
+/** 合并后的 Chunk 内部类型（含 chunkIndex，用于 context expansion） */
+export interface MergedChunk {
+  chunkId: number;
+  chunkIndex: number;           // chunk 在文档内的序号，用于 adjacent expansion
+  documentId: number;
+  documentTitle: string;
+  content: string;
+  score: number;
+  pageRange?: string;
+  heading?: string;
+  chunkType?: string;
+  sourceFile?: string;
+  source: 'vector' | 'bm25' | 'both';
+}
 
 export interface EnhancedSource {
   documentId: number;
@@ -287,6 +308,19 @@ export class PipelineService {
       // 取 Top-K
       finalChunks = finalChunks.slice(0, config.topK);
 
+      // ④.5 Context Expansion（上下文扩展）
+      let contextExpanded = false;
+      if (config.contextMode === 'adjacent' && config.contextWindow > 0 && finalChunks.length > 0) {
+        try {
+          const expandStart = Date.now();
+          finalChunks = await this.expandAdjacentContext(finalChunks, config.contextWindow);
+          contextExpanded = true;
+          console.log(`[Pipeline] Adjacent context expansion (window=${config.contextWindow}): ${Date.now() - expandStart}ms`);
+        } catch (expandError) {
+          console.warn('[Pipeline] Context expansion failed, using raw chunks:', expandError);
+        }
+      }
+
       // ⑤ LLM 生成回答
       const llmStart = Date.now();
       const llmResponse = await this.generateAnswer(
@@ -441,40 +475,16 @@ export class PipelineService {
   private mergeAndDedup(
     vectorResults: ChunkWithScore[],
     bm25Results: BM25SearchResult[]
-  ): Array<{
-    chunkId: number;
-    documentId: number;
-    documentTitle: string;
-    content: string;
-    score: number;
-    pageRange?: string;
-    heading?: string;
-    chunkType?: string;
-    sourceFile?: string;
-    source: 'vector' | 'bm25' | 'both';
-  }> {
-    const mergedMap = new Map<
-      number,
-      {
-        chunkId: number;
-        documentId: number;
-        documentTitle: string;
-        content: string;
-        score: number;
-        pageRange?: string;
-        heading?: string;
-        chunkType?: string;
-        sourceFile?: string;
-        source: 'vector' | 'bm25' | 'both';
-      }
-    >();
+  ): MergedChunk[] {
+    const mergedMap = new Map<number, MergedChunk>();
 
-    // 添加向量检索结果
+    // 添加向量检索结果（自带 chunkIndex）
     for (const vr of vectorResults) {
       const chunkId = vr.chunk.id!;
       const meta = (vr.chunk.metadata || {}) as Record<string, any>;
       mergedMap.set(chunkId, {
         chunkId,
+        chunkIndex: vr.chunk.chunkIndex,
         documentId: vr.documentId,
         documentTitle: vr.documentTitle || '',
         content: vr.chunk.content,
@@ -497,6 +507,7 @@ export class PipelineService {
       } else {
         mergedMap.set(br.chunkId, {
           chunkId: br.chunkId,
+          chunkIndex: -1, // BM25 结果暂无 chunkIndex，expandAdjacentContext 时会通过 DB 补充
           documentId: br.documentId,
           documentTitle: '', // BM25 结果没有 title，后续可以补充
           content: br.content,
@@ -508,6 +519,121 @@ export class PipelineService {
 
     // 按分数排序
     return [...mergedMap.values()].sort((a, b) => b.score - a.score);
+  }
+
+  // ==================== Adjacent Context Expansion ====================
+
+  /**
+   * 相邻 chunk 上下文扩展
+   *
+   * 对每个检索命中的 chunk，查询其前后 N 个相邻 chunk，拼接为更完整的上下文传给 LLM。
+   *
+   * 优化：
+   * - 同一文档的多个命中 chunk 合并为一次 DB 查询
+   * - 相邻 chunk 窗口有重叠时自动去重、合并为连续区间
+   * - BM25-only 结果（chunkIndex=-1）通过额外 DB 查询补充 chunk_index
+   */
+  private async expandAdjacentContext(
+    chunks: MergedChunk[],
+    windowSize: number
+  ): Promise<MergedChunk[]> {
+    if (chunks.length === 0 || windowSize <= 0) return chunks;
+
+    // Step 1: 补全缺失的 chunkIndex（BM25-only 结果可能缺失）
+    const missingIndexChunks = chunks.filter(c => c.chunkIndex < 0);
+    if (missingIndexChunks.length > 0) {
+      const placeholders = missingIndexChunks.map(() => '?').join(',');
+      const indexResult = await this.db.prepare(
+        `SELECT id, chunk_index FROM rag_chunks WHERE id IN (${placeholders})`
+      ).bind(...missingIndexChunks.map(c => c.chunkId)).all();
+
+      const indexMap = new Map<number, number>();
+      for (const row of indexResult.results || []) {
+        indexMap.set(row.id as number, row.chunk_index as number);
+      }
+      for (const c of missingIndexChunks) {
+        const idx = indexMap.get(c.chunkId);
+        if (idx !== undefined) c.chunkIndex = idx;
+      }
+    }
+
+    // 过滤掉仍然无法获取 chunkIndex 的（理论上不应发生）
+    const validChunks = chunks.filter(c => c.chunkIndex >= 0);
+    if (validChunks.length === 0) return chunks;
+
+    // Step 2: 按文档分组，计算每个 chunk 的查询区间 [min, max]
+    const rangesByDoc = new Map<number, Array<{ min: number; max: number; origChunks: MergedChunk[] }>>();
+
+    for (const c of validChunks) {
+      const min = Math.max(0, c.chunkIndex - windowSize);
+      const max = c.chunkIndex + windowSize;
+      if (!rangesByDoc.has(c.documentId)) rangesByDoc.set(c.documentId, []);
+      rangesByDoc.get(c.documentId)!.push({ min, max, origChunks: [c] });
+    }
+
+    // Step 3: 合并同文档下的重叠区间（减少 DB 查询）
+    for (const [docId, ranges] of rangesByDoc) {
+      ranges.sort((a, b) => a.min - b.min);
+      const merged: typeof ranges = [];
+      for (const r of ranges) {
+        if (merged.length > 0 && r.min <= merged[merged.length - 1].max + 1) {
+          // 区间重叠或相邻，合并
+          const last = merged[merged.length - 1];
+          last.max = Math.max(last.max, r.max);
+          last.origChunks.push(...r.origChunks);
+        } else {
+          merged.push({ ...r, origChunks: [...r.origChunks] });
+        }
+      }
+      rangesByDoc.set(docId, merged);
+    }
+
+    // Step 4: 批量查询相邻 chunks（每个文档+区间一次查询）
+    // 收集所有相邻 chunk 的内容，key = "docId:chunkIndex"
+    const adjacentMap = new Map<string, string>();
+
+    for (const [docId, ranges] of rangesByDoc) {
+      for (const range of ranges) {
+        const result = await this.db.prepare(
+          `SELECT chunk_index, content FROM rag_chunks
+           WHERE document_id = ? AND chunk_index BETWEEN ? AND ?
+           ORDER BY chunk_index ASC`
+        ).bind(docId, range.min, range.max).all();
+
+        for (const row of result.results || []) {
+          adjacentMap.set(`${docId}:${row.chunk_index}`, row.content as string);
+        }
+      }
+    }
+
+    // Step 5: 为每个命中 chunk 拼接扩展上下文
+    const expandedChunks: MergedChunk[] = [];
+
+    for (const c of validChunks) {
+      const min = Math.max(0, c.chunkIndex - windowSize);
+      const max = c.chunkIndex + windowSize;
+
+      const parts: string[] = [];
+      for (let idx = min; idx <= max; idx++) {
+        const key = `${c.documentId}:${idx}`;
+        const text = adjacentMap.get(key);
+        if (text) parts.push(text);
+      }
+
+      // 拼接后替换原始 content（保留其他元信息）
+      const expandedContent = parts.length > 0 ? parts.join('\n\n') : c.content;
+
+      expandedChunks.push({
+        ...c,
+        content: expandedContent,
+      });
+    }
+
+    // 补回那些 chunkIndex 无法获取的 chunks（原样保留）
+    const invalidChunks = chunks.filter(c => c.chunkIndex < 0);
+    expandedChunks.push(...invalidChunks);
+
+    return expandedChunks;
   }
 
   /**
@@ -526,20 +652,9 @@ export class PipelineService {
    */
   private async dedicatedRerank(
     query: string,
-    chunks: Array<{
-      chunkId: number;
-      documentId: number;
-      documentTitle: string;
-      content: string;
-      score: number;
-      pageRange?: string;
-      heading?: string;
-      chunkType?: string;
-      sourceFile?: string;
-      source: 'vector' | 'bm25' | 'both';
-    }>,
+    chunks: MergedChunk[],
     rerankWeight: number
-  ): Promise<typeof chunks> {
+  ): Promise<MergedChunk[]> {
     const toRerank = chunks.slice(0, 10);
     const documents = toRerank.map(c => c.content.slice(0, 500));
 
@@ -563,20 +678,9 @@ export class PipelineService {
    */
   private async llmRerank(
     query: string,
-    chunks: Array<{
-      chunkId: number;
-      documentId: number;
-      documentTitle: string;
-      content: string;
-      score: number;
-      pageRange?: string;
-      heading?: string;
-      chunkType?: string;
-      sourceFile?: string;
-      source: 'vector' | 'bm25' | 'both';
-    }>,
+    chunks: MergedChunk[],
     rerankWeight: number
-  ): Promise<typeof chunks> {
+  ): Promise<MergedChunk[]> {
     // 限制重排数量（避免 token 消耗过大）
     const toRerank = chunks.slice(0, 10);
 
@@ -658,17 +762,7 @@ export class PipelineService {
   private async generateAnswer(
     originalQuery: string,
     searchQuery: string,
-    chunks: Array<{
-      chunkId: number;
-      documentId: number;
-      documentTitle: string;
-      content: string;
-      score: number;
-      pageRange?: string;
-      heading?: string;
-      chunkType?: string;
-      source: 'vector' | 'bm25' | 'both';
-    }>,
+    chunks: MergedChunk[],
     conversationHistory: Array<{ role: string; content: string }>,
     intent: IntentResult
   ): Promise<{

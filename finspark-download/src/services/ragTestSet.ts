@@ -119,6 +119,10 @@ export interface EvalConfig {
   enableRerank: boolean;
   rerankWeight: number;
   llmModel?: string;
+
+  // === Context Expansion（上下文扩展，用于 A/B 评估对比） ===
+  contextMode?: 'none' | 'adjacent' | 'parent';  // 上下文扩展模式（默认 none）
+  contextWindow?: number;                          // adjacent 模式窗口大小（默认 1）
 }
 
 // ==================== Service 实现 ====================
