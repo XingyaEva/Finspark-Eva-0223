@@ -167,6 +167,8 @@ export interface ChunkMetadata {
   category?: string;
   /** 在文档中的位置比例 (0-1) */
   positionRatio?: number;
+  /** Parent-Child: 所属章节的起始 chunk 索引 */
+  parentSectionIdx?: number;
 }
 
 export interface ChunkWithScore {
@@ -712,12 +714,14 @@ export class RAGService {
   }
 
   /**
-   * 结构感知分块：将 extractStructuredBlocks 的输出转换为带元数据的切片
+   * 结构感知分块 v2：将 extractStructuredBlocks 的输出转换为带元数据的切片
    * 
-   * 规则：
-   * - table 块：整块保留为一个 chunk（HTML 格式），不做二次切分
-   * - heading 块：与后续 text 合并
-   * - text 块：按 chunkSize/chunkOverlap 正常切分，每个子块继承父块的页码/标题
+   * 改进（v2）：
+   * - table 块：整块保留为一个 chunk（HTML），同时生成纯文本摘要 chunk 用于 embedding 检索
+   * - heading 块：不单独成 chunk，作为后续 text 的 metadata
+   * - text 块：优先按句子边界切分（800-1200 字窗口），替代固定 500 字硬切
+   * - 碎片合并：<100 字的短块合并到相邻块
+   * - Parent-Child：每个 child chunk 记录所属 section 的 parent_id
    */
   private buildStructuredChunks(
     blocks: import('../services/ragPdfParser').StructuredBlock[],
@@ -725,6 +729,13 @@ export class RAGService {
   ): Array<{ text: string; meta: ChunkMetadata }> {
     const result: Array<{ text: string; meta: ChunkMetadata }> = [];
     const totalBlocks = blocks.length;
+
+    // P1: 使用更大的窗口进行句子边界切分
+    const effectiveChunkSize = Math.max(opts.chunkSize, 800);
+    const effectiveOverlap = Math.max(opts.chunkOverlap, 50);
+
+    // 追踪当前章节，用于 parent-child
+    let currentSectionStart = 0; // result[] 中当前章节的起始索引
 
     for (let i = 0; i < blocks.length; i++) {
       const block = blocks[i];
@@ -741,30 +752,49 @@ export class RAGService {
       };
 
       if (block.type === 'table') {
-        // 表格块：整块保留（HTML 内容），不二次分割
+        // ── 表格块：整块保留 + 生成纯文本摘要 ──
         result.push({
-          text: block.content, // 已是 HTML
+          text: block.content, // 完整 HTML
           meta: {
             ...baseMeta,
             tableIndex: block.tableIndex,
             tableCaption: block.tableCaption,
           },
         });
-      } else if (block.type === 'heading') {
-        // heading 块通常很短，跳过单独成块（会作为后续 text 的 heading 属性保留）
-        // 但如果 heading 内容本身有价值（如目录条目），可以保留
-        if (block.content.length > 10) {
-          result.push({ text: block.content, meta: baseMeta });
+
+        // 生成表格纯文本摘要用于 embedding 检索（HTML 标签噪音影响 embedding 质量）
+        const tablePlainText = this.extractTablePlainText(block.content, block.tableCaption);
+        if (tablePlainText.length > 20) {
+          result.push({
+            text: tablePlainText,
+            meta: {
+              ...baseMeta,
+              chunkType: 'text', // 标记为 text 以便 embedding 检索
+              tableIndex: block.tableIndex,
+              tableCaption: block.tableCaption,
+            },
+          });
         }
+
+      } else if (block.type === 'heading') {
+        // ── heading 块：记录章节变更，不单独成 chunk ──
+        // 章节变更时更新 parent 追踪
+        if ((block.headingLevel || 0) <= 2) {
+          currentSectionStart = result.length;
+        }
+        // heading 内容会通过 baseMeta.heading 传递给后续 text 块
+        // 仅当 heading 本身有重要信息时才单独保留
+        if (block.content.length > 30) {
+          result.push({ text: block.content, meta: { ...baseMeta, chunkType: 'text' } });
+        }
+
       } else {
-        // text 块：按配置大小切分，每个子块继承元数据
-        if (block.content.length <= opts.chunkSize) {
+        // ── text 块：句子边界切分 ──
+        if (block.content.length <= effectiveChunkSize) {
           result.push({ text: block.content, meta: baseMeta });
         } else {
-          const subChunks = splitTextIntoChunks(block.content, {
-            chunkSize: opts.chunkSize,
-            chunkOverlap: opts.chunkOverlap,
-          });
+          // 使用句子边界优先的切分
+          const subChunks = this.splitBySentenceBoundary(block.content, effectiveChunkSize, effectiveOverlap);
           for (const sub of subChunks) {
             result.push({ text: sub, meta: { ...baseMeta } });
           }
@@ -772,7 +802,133 @@ export class RAGService {
       }
     }
 
-    return result;
+    // P1: 碎片合并 — 将 <100 字的短 chunk 合并到前一个 chunk
+    const MIN_CHUNK_SIZE = 100;
+    const merged: Array<{ text: string; meta: ChunkMetadata }> = [];
+    for (const item of result) {
+      if (item.text.length < MIN_CHUNK_SIZE && merged.length > 0) {
+        const prev = merged[merged.length - 1];
+        // 只合并同类型（都是 text）且合并后不超过上限的
+        if (prev.meta.chunkType === 'text' && item.meta.chunkType === 'text'
+            && (prev.text.length + item.text.length) < effectiveChunkSize * 1.5) {
+          prev.text += '\n' + item.text;
+          // 更新 pageEnd
+          if (item.meta.pageEnd && item.meta.pageEnd > (prev.meta.pageEnd || 0)) {
+            prev.meta.pageEnd = item.meta.pageEnd;
+          }
+          continue;
+        }
+      }
+      merged.push(item);
+    }
+
+    // P2: 为每个 child chunk 标记 parent_section_id（章节内的第一个 chunk 索引）
+    let sectionStartIdx = 0;
+    for (let j = 0; j < merged.length; j++) {
+      const meta = merged[j].meta;
+      if (meta.headingLevel && meta.headingLevel <= 2 && meta.chunkType !== 'text') {
+        sectionStartIdx = j;
+      }
+      meta.parentSectionIdx = sectionStartIdx;
+    }
+
+    console.log(`[StructuredChunks v2] ${result.length} raw → ${merged.length} merged ` +
+      `(tables: ${merged.filter(c => c.meta.chunkType === 'table').length}, ` +
+      `text: ${merged.filter(c => c.meta.chunkType === 'text').length}, ` +
+      `avg len: ${Math.round(merged.reduce((s, c) => s + c.text.length, 0) / merged.length)})`);
+
+    return merged;
+  }
+
+  /**
+   * 从 HTML 表格中提取纯文本摘要（用于 embedding）
+   */
+  private extractTablePlainText(html: string, caption?: string): string {
+    // 移除 HTML 标签，保留文本内容
+    let text = html
+      .replace(/<\/?(?:table|thead|tbody|tfoot|tr)\s*>/gi, '\n')
+      .replace(/<(?:td|th)[^>]*>/gi, ' | ')
+      .replace(/<\/(?:td|th)\s*>/gi, '')
+      .replace(/<[^>]+>/g, '')
+      .replace(/\s*\|\s*\|\s*/g, ' | ')
+      .replace(/\n{2,}/g, '\n')
+      .trim();
+
+    // 添加表格标题前缀
+    if (caption) {
+      text = `[表格: ${caption}]\n${text}`;
+    }
+
+    // 限制长度（过大的表格摘要截断）
+    if (text.length > 2000) {
+      text = text.slice(0, 2000) + '...(表格内容过长已截断)';
+    }
+
+    return text;
+  }
+
+  /**
+   * P1: 句子边界优先切分
+   * 在中文句号、感叹号、问号处优先切分，保证 chunk 不在句中截断
+   */
+  private splitBySentenceBoundary(text: string, maxSize: number, overlap: number): string[] {
+    // 中文句子终止符
+    const sentenceEnders = /([。！？；\n\n])/g;
+    const sentences: string[] = [];
+    let lastIdx = 0;
+
+    // 按句子切分
+    let match;
+    while ((match = sentenceEnders.exec(text)) !== null) {
+      const end = match.index + match[0].length;
+      const sentence = text.slice(lastIdx, end);
+      if (sentence.trim()) {
+        sentences.push(sentence);
+      }
+      lastIdx = end;
+    }
+    // 剩余文本
+    if (lastIdx < text.length) {
+      const remaining = text.slice(lastIdx).trim();
+      if (remaining) sentences.push(remaining);
+    }
+
+    if (sentences.length === 0) return [text];
+
+    // 将句子组合成 chunks（不超过 maxSize）
+    const chunks: string[] = [];
+    let current = '';
+
+    for (const sentence of sentences) {
+      if (current.length + sentence.length <= maxSize) {
+        current += sentence;
+      } else {
+        if (current.trim()) {
+          chunks.push(current.trim());
+        }
+        // 如果单句超过 maxSize，使用传统切分
+        if (sentence.length > maxSize) {
+          const subChunks = splitTextIntoChunks(sentence, { chunkSize: maxSize, chunkOverlap: overlap });
+          chunks.push(...subChunks);
+          current = '';
+        } else {
+          // 添加 overlap（取前一个 chunk 最后的 overlap 字符）
+          if (overlap > 0 && chunks.length > 0) {
+            const lastChunk = chunks[chunks.length - 1];
+            const overlapText = lastChunk.slice(-Math.min(overlap, lastChunk.length));
+            current = overlapText + sentence;
+          } else {
+            current = sentence;
+          }
+        }
+      }
+    }
+
+    if (current.trim()) {
+      chunks.push(current.trim());
+    }
+
+    return chunks.length > 0 ? chunks : [text];
   }
   
   /**

@@ -759,6 +759,33 @@ export interface StructuredBlock {
  *
  * 每个块附带 page / heading 上下文，供后续分块时作为 metadata
  */
+/**
+ * 中文财报章节标题模式
+ * 匹配 "第一节 重要提示"、"第二节  公司简介" 等（支持中文数字和阿拉伯数字）
+ */
+const CN_SECTION_REGEX = /^第[一二三四五六七八九十\d]+节\s*.+/;
+
+/**
+ * 中文子章节标题模式
+ * 匹配 "一、"、"（一）"、"1、"、"1."、"（1）" 等常见编号模式
+ */
+const CN_SUBSECTION_REGEX = /^(?:[一二三四五六七八九十]+、|（[一二三四五六七八九十\d]+）|\d+[、.．]\s*\S)/;
+
+/**
+ * 检测行是否是 HTML 表格内容（MinerU 直接输出 HTML 表格而非 Markdown 管道格式）
+ */
+const HTML_TABLE_LINE_REGEX = /^\s*<\/?(?:table|tr|td|th|thead|tbody|tfoot)\b/i;
+
+/**
+ * 检测 HTML 表格开始标签
+ */
+const HTML_TABLE_START_REGEX = /^\s*<table\b/i;
+
+/**
+ * 检测 HTML 表格结束标签（可能在行中任意位置）
+ */
+const HTML_TABLE_END_REGEX = /<\/table\s*>/i;
+
 export function extractStructuredBlocks(markdown: string): StructuredBlock[] {
   const lines = markdown.split('\n');
   const blocks: StructuredBlock[] = [];
@@ -767,11 +794,33 @@ export function extractStructuredBlocks(markdown: string): StructuredBlock[] {
   let currentHeading = '';
   let currentHeadingLevel = 0;
   let tableCounter = 0;
+  let hasPageMarkers = false;
+
+  // 预扫描：检测是否有 MinerU 页码标记
+  const totalChars = markdown.length;
+  for (const line of lines) {
+    if (/<!--\s*page\s*:\s*\d+\s*-->/i.test(line)) {
+      hasPageMarkers = true;
+      break;
+    }
+  }
+
+  // 如果没有页码标记，使用字符位置估算页码（中文财报约 2000-3000 字/页）
+  const CHARS_PER_PAGE = 2500;
+  let charCounter = 0;
 
   let textBuffer: string[] = [];
   let tableBuffer: string[] = [];
+  let htmlTableBuffer: string[] = [];
+  let htmlTableDepth = 0; // 追踪 <table> 嵌套深度
   let tableStartPage = 1;
   let textStartPage = 1;
+
+  /** 估算当前页码 */
+  function estimatePage(): number {
+    if (hasPageMarkers) return currentPage;
+    return Math.max(1, Math.ceil(charCounter / CHARS_PER_PAGE));
+  }
 
   /** 刷新文本缓冲区 → 生成 text block */
   function flushText() {
@@ -781,47 +830,31 @@ export function extractStructuredBlocks(markdown: string): StructuredBlock[] {
         type: 'text',
         content: text,
         pageStart: textStartPage,
-        pageEnd: currentPage,
+        pageEnd: estimatePage(),
         heading: currentHeading || undefined,
         headingLevel: currentHeadingLevel || undefined,
       });
     }
     textBuffer = [];
-    textStartPage = currentPage;
+    textStartPage = estimatePage();
   }
 
-  /** 刷新表格缓冲区 → 生成 table block (HTML) */
-  function flushTable() {
+  /** 刷新 Markdown 管道表格缓冲区 → 生成 table block (HTML) */
+  function flushMdTable() {
     if (tableBuffer.length === 0) return;
 
     const rawMd = tableBuffer.join('\n').trim();
     const html = markdownTableToHtml(rawMd);
     tableCounter++;
 
-    // 查找表格标题：表格上方紧邻的非空文本行
-    let caption = '';
-    for (let i = blocks.length - 1; i >= 0; i--) {
-      if (blocks[i].type === 'text') {
-        const lastLine = blocks[i].content.split('\n').pop()?.trim() || '';
-        // 常见表格标题模式：以"表"/"Table"/"图"开头，或以"："/"："结尾
-        if (lastLine && (
-          /^[表图][\s\d]/.test(lastLine) ||
-          /^Table\s/i.test(lastLine) ||
-          /[：:]$/.test(lastLine) ||
-          lastLine.length < 60
-        )) {
-          caption = lastLine;
-        }
-        break;
-      }
-    }
+    const caption = findTableCaption();
 
     blocks.push({
       type: 'table',
       content: html,
       rawMarkdown: rawMd,
       pageStart: tableStartPage,
-      pageEnd: currentPage,
+      pageEnd: estimatePage(),
       heading: currentHeading || undefined,
       headingLevel: currentHeadingLevel || undefined,
       tableIndex: tableCounter,
@@ -831,19 +864,113 @@ export function extractStructuredBlocks(markdown: string): StructuredBlock[] {
     tableBuffer = [];
   }
 
+  /** 刷新 HTML 表格缓冲区（MinerU 直接输出的 HTML 表格） */
+  function flushHtmlTable() {
+    if (htmlTableBuffer.length === 0) return;
+
+    const html = htmlTableBuffer.join('\n').trim();
+    // 确保有完整的 <table> 标签
+    const content = html.includes('<table') ? html : `<table>${html}</table>`;
+    tableCounter++;
+
+    const caption = findTableCaption();
+
+    blocks.push({
+      type: 'table',
+      content,
+      pageStart: tableStartPage,
+      pageEnd: estimatePage(),
+      heading: currentHeading || undefined,
+      headingLevel: currentHeadingLevel || undefined,
+      tableIndex: tableCounter,
+      tableCaption: caption || undefined,
+    });
+
+    htmlTableBuffer = [];
+    htmlTableDepth = 0;
+  }
+
+  /** 查找表格标题：表格上方紧邻的非空文本行 */
+  function findTableCaption(): string {
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      if (blocks[i].type === 'text') {
+        const lastLine = blocks[i].content.split('\n').pop()?.trim() || '';
+        if (lastLine && (
+          /^[表图][\s\d]/.test(lastLine) ||
+          /^Table\s/i.test(lastLine) ||
+          /[：:]$/.test(lastLine) ||
+          /单位[：:]/.test(lastLine) ||
+          lastLine.length < 60
+        )) {
+          return lastLine;
+        }
+        break;
+      }
+    }
+    return '';
+  }
+
+  /** 检测中文财报章节标题 */
+  function detectChineseHeading(line: string): { level: number; text: string } | null {
+    const trimmed = line.trim();
+    if (CN_SECTION_REGEX.test(trimmed)) {
+      return { level: 1, text: trimmed };
+    }
+    if (CN_SUBSECTION_REGEX.test(trimmed) && trimmed.length < 80) {
+      // 避免将普通段落首句误判为标题
+      return { level: 2, text: trimmed };
+    }
+    return null;
+  }
+
   for (const line of lines) {
-    // 检测 MinerU 页码注释 <!-- page: N -->
+    charCounter += line.length + 1; // +1 for \n
+
+    // ─── 1. 检测 MinerU 页码注释 <!-- page: N --> ───
     const pageMatch = line.match(/<!--\s*page\s*:\s*(\d+)\s*-->/i);
     if (pageMatch) {
       currentPage = parseInt(pageMatch[1], 10);
-      continue; // 页码标记行本身不输出
+      continue;
     }
 
-    // 检测标题行
+    // ─── 2. 如果在 HTML 表格收集中，继续收集直到 </table> ───
+    if (htmlTableDepth > 0) {
+      htmlTableBuffer.push(line);
+      // 计算 <table> 和 </table> 标签来追踪嵌套
+      const opens = (line.match(/<table\b/gi) || []).length;
+      const closes = (line.match(/<\/table\s*>/gi) || []).length;
+      htmlTableDepth += opens - closes;
+      if (htmlTableDepth <= 0) {
+        htmlTableDepth = 0;
+        flushHtmlTable();
+      }
+      continue;
+    }
+
+    // ─── 3. 检测 HTML 表格开始 <table> ───
+    if (HTML_TABLE_START_REGEX.test(line)) {
+      // 先刷新文本和 Markdown 表格
+      if (tableBuffer.length > 0) flushMdTable();
+      flushText();
+      tableStartPage = estimatePage();
+
+      htmlTableBuffer.push(line);
+      const opens = (line.match(/<table\b/gi) || []).length;
+      const closes = (line.match(/<\/table\s*>/gi) || []).length;
+      htmlTableDepth = opens - closes;
+
+      if (htmlTableDepth <= 0) {
+        // 整个表格在一行内（常见于 MinerU 输出）
+        htmlTableDepth = 0;
+        flushHtmlTable();
+      }
+      continue;
+    }
+
+    // ─── 4. 检测 Markdown # 标题行 ───
     const headingMatch = line.match(/^(#{1,6})\s+(.+)/);
     if (headingMatch) {
-      // 先刷新之前的缓冲区
-      if (tableBuffer.length > 0) flushTable();
+      if (tableBuffer.length > 0) flushMdTable();
       flushText();
 
       currentHeadingLevel = headingMatch[1].length;
@@ -852,42 +979,65 @@ export function extractStructuredBlocks(markdown: string): StructuredBlock[] {
       blocks.push({
         type: 'heading',
         content: currentHeading,
-        pageStart: currentPage,
-        pageEnd: currentPage,
+        pageStart: estimatePage(),
+        pageEnd: estimatePage(),
         heading: currentHeading,
         headingLevel: currentHeadingLevel,
       });
-      textStartPage = currentPage;
+      textStartPage = estimatePage();
       continue;
     }
 
-    // 检测表格行（以 | 开头或是分隔线 |---|）
+    // ─── 5. 检测中文财报章节标题 ───
+    const cnHeading = detectChineseHeading(line);
+    if (cnHeading && tableBuffer.length === 0) {
+      flushText();
+
+      currentHeadingLevel = cnHeading.level;
+      currentHeading = cnHeading.text;
+
+      blocks.push({
+        type: 'heading',
+        content: currentHeading,
+        pageStart: estimatePage(),
+        pageEnd: estimatePage(),
+        heading: currentHeading,
+        headingLevel: currentHeadingLevel,
+      });
+      textStartPage = estimatePage();
+      continue;
+    }
+
+    // ─── 6. 检测 Markdown 管道表格行 ───
     const isTableLine = /^\s*\|/.test(line);
 
     if (isTableLine) {
-      // 进入/继续表格
       if (tableBuffer.length === 0) {
-        // 表格开始前，先刷新文本
         flushText();
-        tableStartPage = currentPage;
+        tableStartPage = estimatePage();
       }
       tableBuffer.push(line);
     } else {
-      // 非表格行
       if (tableBuffer.length > 0) {
-        // 表格刚结束
-        flushTable();
+        flushMdTable();
       }
       if (textBuffer.length === 0) {
-        textStartPage = currentPage;
+        textStartPage = estimatePage();
       }
       textBuffer.push(line);
     }
   }
 
   // 清空剩余缓冲区
-  if (tableBuffer.length > 0) flushTable();
+  if (tableBuffer.length > 0) flushMdTable();
+  if (htmlTableBuffer.length > 0) flushHtmlTable();
   flushText();
+
+  console.log(`[StructuredBlocks] Extracted ${blocks.length} blocks: ` +
+    `${blocks.filter(b => b.type === 'heading').length} headings, ` +
+    `${blocks.filter(b => b.type === 'table').length} tables, ` +
+    `${blocks.filter(b => b.type === 'text').length} text ` +
+    `(pageMarkers=${hasPageMarkers})`);
 
   return blocks;
 }
