@@ -436,6 +436,8 @@ ragEnhance.post('/evaluations/:id/run', async (c) => {
           chunkId: s.chunkId || 0,
           pageRange: s.pageRange,
           relevanceScore: s.relevanceScore,
+          chunkContent: s.chunkContent || '',
+          documentTitle: s.documentTitle || '',
         })),
         latencyMs: result.pipeline.totalLatencyMs,
         tokensInput: 0,
