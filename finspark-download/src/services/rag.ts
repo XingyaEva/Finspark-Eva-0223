@@ -964,10 +964,19 @@ export class RAGService {
   }
 
   /**
-   * KV 全扫向量检索（旧方案，作为降级路径保留）
+   * 两阶段混合检索（替代原 KV 全扫方案）
    * 
-   * 逻辑：遍历所有 chunk 的 KV embedding，逐条计算 cosine similarity
-   * 性能：O(N)，>1000 chunks 时延迟 >3s
+   * Stage 1: FTS5 全文检索预筛选候选 chunk（~10ms，返回 topK*10 条）
+   * Stage 2: 对候选 chunk 生成 query embedding + 从 KV 加载 chunk embedding，
+   *          计算 cosine similarity 并重排序
+   * 
+   * 优势：
+   * - 避免全扫 31K+ chunks，KV 读取 <100 次
+   * - 完全在 Workers CPU/Memory 限制内运行
+   * - 兼顾关键词匹配（BM25）和语义相似度（向量）
+   * 
+   * 降级策略：
+   * - FTS5 失败时回退到有限 D1 查询（LIMIT 200）
    */
   private async searchSimilarKV(
     query: string,
@@ -979,48 +988,103 @@ export class RAGService {
       category?: string;
     } = {}
   ): Promise<ChunkWithScore[]> {
-    const { topK = 5, minScore = 0.3, stockCode, documentIds, category } = options;
+    const { topK = 5, minScore = 0.25, stockCode, documentIds, category } = options;
     
     // 1. 生成查询的embedding（使用配置的Provider）
     const queryEmbedding = await generateEmbedding(query, this.embeddingConfig);
     
-    // 2. 获取候选chunks
-    let sql = `
-      SELECT c.id, c.document_id, c.chunk_index, c.content, c.content_length, c.embedding_key, c.metadata,
-             d.title as document_title
-      FROM rag_chunks c
-      JOIN rag_documents d ON c.document_id = d.id
-      WHERE c.has_embedding = 1 AND d.status = 'completed'
-    `;
-    const bindParams: any[] = [];
+    // 2. Stage 1: FTS5 预筛选候选 chunk IDs
+    const FTS_CANDIDATE_LIMIT = Math.max(topK * 10, 50); // 至少取50个候选
+    let candidates: any[] = [];
     
-    if (stockCode) {
-      sql += ' AND d.stock_code = ?';
-      bindParams.push(stockCode);
+    try {
+      // 构建 FTS5 查询：清洗特殊字符
+      const ftsQuery = query
+        .replace(/[""'']/g, '"')
+        .replace(/[(){}[\]^~*:]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      
+      if (ftsQuery) {
+        let ftsSql = `
+          SELECT 
+            f.rowid AS chunk_id,
+            c.id, c.document_id, c.chunk_index, c.content, c.content_length, 
+            c.embedding_key, c.metadata,
+            d.title as document_title,
+            bm25(rag_chunks_fts) AS bm25_score
+          FROM rag_chunks_fts f
+          JOIN rag_chunks c ON c.id = f.rowid
+          JOIN rag_documents d ON d.id = c.document_id
+          WHERE rag_chunks_fts MATCH ?
+            AND c.has_embedding = 1 
+            AND d.status = 'completed'
+        `;
+        const ftsBinds: any[] = [ftsQuery];
+        
+        if (stockCode) {
+          ftsSql += ' AND d.stock_code = ?';
+          ftsBinds.push(stockCode);
+        }
+        if (documentIds && documentIds.length > 0) {
+          ftsSql += ` AND c.document_id IN (${documentIds.map(() => '?').join(',')})`;
+          ftsBinds.push(...documentIds);
+        }
+        if (category) {
+          ftsSql += ' AND d.category = ?';
+          ftsBinds.push(category);
+        }
+        
+        ftsSql += ` ORDER BY bm25_score LIMIT ?`;
+        ftsBinds.push(FTS_CANDIDATE_LIMIT);
+        
+        const ftsResult = await this.db.prepare(ftsSql).bind(...ftsBinds).all();
+        candidates = ftsResult.results || [];
+        console.log(`[RAG] FTS5 pre-filter: ${candidates.length} candidates for query "${query.slice(0, 30)}"`);
+      }
+    } catch (ftsError) {
+      console.warn('[RAG] FTS5 pre-filter failed, falling back to D1 LIMIT query:', ftsError);
     }
     
-    if (documentIds && documentIds.length > 0) {
-      sql += ` AND c.document_id IN (${documentIds.map(() => '?').join(',')})`;
-      bindParams.push(...documentIds);
+    // 降级：FTS5 失败或无结果时，使用 D1 带 LIMIT 查询（随机取一批 chunk）
+    if (candidates.length === 0) {
+      const D1_FALLBACK_LIMIT = Math.max(topK * 20, 200);
+      let sql = `
+        SELECT c.id, c.document_id, c.chunk_index, c.content, c.content_length, c.embedding_key, c.metadata,
+               d.title as document_title
+        FROM rag_chunks c
+        JOIN rag_documents d ON c.document_id = d.id
+        WHERE c.has_embedding = 1 AND d.status = 'completed'
+      `;
+      const bindParams: any[] = [];
+      
+      if (stockCode) {
+        sql += ' AND d.stock_code = ?';
+        bindParams.push(stockCode);
+      }
+      if (documentIds && documentIds.length > 0) {
+        sql += ` AND c.document_id IN (${documentIds.map(() => '?').join(',')})`;
+        bindParams.push(...documentIds);
+      }
+      if (category) {
+        sql += ' AND d.category = ?';
+        bindParams.push(category);
+      }
+      
+      sql += ` LIMIT ?`;
+      bindParams.push(D1_FALLBACK_LIMIT);
+      
+      const stmt = this.db.prepare(sql).bind(...bindParams);
+      const result = await stmt.all();
+      candidates = result.results || [];
+      console.log(`[RAG] D1 fallback: ${candidates.length} candidates`);
     }
-    
-    if (category) {
-      sql += ' AND d.category = ?';
-      bindParams.push(category);
-    }
-    
-    const stmt = bindParams.length > 0
-      ? this.db.prepare(sql).bind(...bindParams)
-      : this.db.prepare(sql);
-    
-    const result = await stmt.all();
-    const candidates = result.results || [];
     
     if (candidates.length === 0) {
       return [];
     }
     
-    // 3. 从KV批量获取embedding并计算相似度
+    // 3. Stage 2: 从 KV 加载 embedding 并计算 cosine similarity
     const scoredChunks: ChunkWithScore[] = [];
     
     // 并行获取embedding（最多50个一批）
@@ -1029,7 +1093,10 @@ export class RAGService {
       const batch = candidates.slice(i, i + FETCH_BATCH);
       
       const embeddingPromises = batch.map(async (candidate: any) => {
-        const embeddingStr = await this.kv.get(candidate.embedding_key);
+        const embeddingKey = candidate.embedding_key;
+        if (!embeddingKey) return null;
+        
+        const embeddingStr = await this.kv.get(embeddingKey);
         if (!embeddingStr) return null;
         
         const chunkEmbedding = JSON.parse(embeddingStr) as number[];
@@ -1043,7 +1110,7 @@ export class RAGService {
               chunkIndex: candidate.chunk_index as number,
               content: candidate.content as string,
               contentLength: candidate.content_length as number,
-              embeddingKey: candidate.embedding_key as string,
+              embeddingKey: embeddingKey as string,
               hasEmbedding: true,
               metadata: JSON.parse((candidate.metadata as string) || '{}'),
             },
@@ -1059,8 +1126,9 @@ export class RAGService {
       scoredChunks.push(...batchResults.filter((r): r is ChunkWithScore => r !== null));
     }
     
-    // 4. 按相似度排序，取topK
+    // 4. 按 cosine similarity 排序，取 topK
     scoredChunks.sort((a, b) => b.score - a.score);
+    console.log(`[RAG] Hybrid search: ${scoredChunks.length} results above minScore=${minScore}, returning top ${topK}`);
     return scoredChunks.slice(0, topK);
   }
   
