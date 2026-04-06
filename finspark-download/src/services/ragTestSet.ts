@@ -60,6 +60,7 @@ export interface Evaluation {
   semantic_score: number | null;
   recall_score: number | null;
   citation_score: number | null;
+  faithfulness_score: number | null;
   scores_by_type: string;
   scores_by_difficulty: string;
   error_message: string | null;
@@ -555,7 +556,7 @@ ${chunkTexts}`;
    */
   async runEvaluation(evaluationId: number, ragQueryFn: (question: string, config: any) => Promise<{
     answer: string;
-    sources: { documentId: number; chunkId: number; pageRange?: string; relevanceScore: number }[];
+    sources: { documentId: number; chunkId: number; pageRange?: string; relevanceScore: number; chunkContent?: string; documentTitle?: string }[];
     latencyMs: number;
     tokensInput: number;
     tokensOutput: number;
@@ -588,6 +589,7 @@ ${chunkTexts}`;
     let semanticScoreSum = 0;
     let recallScoreSum = 0;
     let citationScoreSum = 0;
+    let faithfulnessScoreSum = 0;
 
     // Parse existing scores from scoring_reason
     for (const r of existingResults) {
@@ -595,9 +597,11 @@ ${chunkTexts}`;
       const semMatch = reason.match(/语义:\s*(\d+)%/);
       const recMatch = reason.match(/召回:\s*(\d+)%/);
       const citMatch = reason.match(/引用:\s*(\d+)%/);
+      const faithMatch = reason.match(/忠实:\s*(\d+)%/);
       semanticScoreSum += semMatch ? parseInt(semMatch[1]) : (r.score || 0);
       recallScoreSum += recMatch ? parseInt(recMatch[1]) : 100;
       citationScoreSum += citMatch ? parseInt(citMatch[1]) : 0;
+      faithfulnessScoreSum += faithMatch ? parseInt(faithMatch[1]) : 50;
     }
 
     const typeScores: Record<string, { total: number; sum: number }> = {};
@@ -644,6 +648,7 @@ ${chunkTexts}`;
         semanticScoreSum += scoring.semanticScore;
         recallScoreSum += scoring.recallScore;
         citationScoreSum += scoring.citationScore;
+        faithfulnessScoreSum += scoring.faithfulnessScore;
 
         // By type
         if (!typeScores[q.question_type]) typeScores[q.question_type] = { total: 0, sum: 0 };
@@ -682,13 +687,21 @@ ${chunkTexts}`;
       }
     }
 
-    // Calculate final scores
+    // Calculate final scores (5-dimension weighted formula)
     const total = questions.length || 1;
     const exactMatchScore = (exactMatchCorrect / total) * 100;
     const semanticScore = (semanticScoreSum / total);
     const recallScore = (recallScoreSum / total);
     const citationScore = (citationScoreSum / total);
-    const overallScore = (exactMatchScore * 0.3 + semanticScore * 0.3 + recallScore * 0.2 + citationScore * 0.2);
+    const faithfulnessScore = (faithfulnessScoreSum / total);
+    // Updated: semantic 30% + faithfulness 20% + exact 20% + recall 15% + citation 15%
+    const overallScore = (
+      semanticScore * 0.30 +
+      faithfulnessScore * 0.20 +
+      exactMatchScore * 0.20 +
+      recallScore * 0.15 +
+      citationScore * 0.15
+    );
 
     const scoresByType: Record<string, number> = {};
     for (const [k, v] of Object.entries(typeScores)) {
@@ -699,11 +712,12 @@ ${chunkTexts}`;
       scoresByDifficulty[k] = Math.round((v.sum / v.total) * 10) / 10;
     }
 
-    // Final update
+    // Final update (includes faithfulness_score)
     await this.db.prepare(
       `UPDATE rag_evaluations SET
        status = 'completed', completed_questions = ?, overall_score = ?,
        exact_match_score = ?, semantic_score = ?, recall_score = ?, citation_score = ?,
+       faithfulness_score = ?,
        scores_by_type = ?, scores_by_difficulty = ?, completed_at = datetime('now')
        WHERE id = ?`
     ).bind(
@@ -712,6 +726,7 @@ ${chunkTexts}`;
       Math.round(semanticScore * 10) / 10,
       Math.round(recallScore * 10) / 10,
       Math.round(citationScore * 10) / 10,
+      Math.round(faithfulnessScore * 10) / 10,
       JSON.stringify(scoresByType),
       JSON.stringify(scoresByDifficulty),
       evaluationId
@@ -729,18 +744,23 @@ ${chunkTexts}`;
   }
 
   // ============================================================
-  // 四维打分系统
+  // 五维增强打分系统 (v2)
+  // 维度: 语义正确性 30% + 忠实度 20% + 精确匹配 20% + 召回 15% + 引用 15%
   // ============================================================
 
   private async scoreResult(
     question: TestQuestion,
-    result: { answer: string; sources: { documentId: number; chunkId: number; pageRange?: string; relevanceScore: number }[] }
+    result: {
+      answer: string;
+      sources: { documentId: number; chunkId: number; pageRange?: string; relevanceScore: number; chunkContent?: string; documentTitle?: string }[];
+    }
   ): Promise<{
     overallScore: number;
     isCorrect: boolean;
     semanticScore: number;
     recallScore: number;
     citationScore: number;
+    faithfulnessScore: number;
     reason: string;
   }> {
     const expected = question.expected_answer.trim();
@@ -748,14 +768,16 @@ ${chunkTexts}`;
 
     // 1. Exact match scoring (for number/name/boolean types)
     let isCorrect = false;
-    if (['number', 'name', 'boolean'].includes(question.question_type)) {
+    if (['number', 'name', 'boolean', 'factual'].includes(question.question_type)) {
       isCorrect = this.fuzzyMatch(expected, actual);
     }
 
-    // 2. Semantic scoring via LLM
+    // 2. Enhanced semantic scoring via LLM (type-differentiated prompt)
     let semanticScore = 0;
     try {
-      semanticScore = await this.llmSemanticScore(question.question, expected, actual);
+      semanticScore = await this.llmSemanticScore(
+        question.question, expected, actual, question.question_type, question.difficulty
+      );
     } catch {
       // Fallback to simple overlap
       semanticScore = this.simpleOverlapScore(expected, actual);
@@ -763,11 +785,12 @@ ${chunkTexts}`;
 
     if (semanticScore >= 80) isCorrect = true;
 
-    // 3. Recall scoring — check if reference pages were retrieved
-    let recallScore = 100; // default if no reference pages specified
+    // 3. Recall scoring — FIXED: use document-hit when no reference pages
+    let recallScore = 0;
     try {
       const refPages = JSON.parse(question.reference_pages || '[]') as string[];
       if (refPages.length > 0) {
+        // Original page-level recall
         const retrievedPages = result.sources
           .map(s => s.pageRange)
           .filter(Boolean);
@@ -775,9 +798,13 @@ ${chunkTexts}`;
           retrievedPages.some(tp => tp && tp.includes(rp))
         );
         recallScore = (found.length / refPages.length) * 100;
+      } else {
+        // Fallback: document-level recall + content relevance
+        // Check if retrieved sources contain meaningful content (not empty/error)
+        recallScore = this.computeDocumentRecall(expected, actual, result.sources);
       }
     } catch {
-      recallScore = 50; // error parsing
+      recallScore = 30; // error parsing
     }
 
     // 4. Citation scoring — how many sources used were relevant
@@ -785,36 +812,151 @@ ${chunkTexts}`;
     if (result.sources.length > 0) {
       const highScoreSources = result.sources.filter(s => s.relevanceScore >= 0.5);
       citationScore = (highScoreSources.length / result.sources.length) * 100;
-    } else {
-      citationScore = 0;
     }
 
+    // 5. NEW: Faithfulness scoring — does the answer stay within context?
+    let faithfulnessScore = 50; // default neutral
+    try {
+      const contextText = this.buildContextForFaithfulness(result.sources);
+      if (contextText && actual) {
+        faithfulnessScore = await this.llmFaithfulnessScore(
+          question.question, actual, contextText
+        );
+      }
+    } catch (err) {
+      console.warn('[Eval] Faithfulness scoring failed, using fallback:', err);
+      // Fallback: if answer is short and sources are relevant, assume decent faithfulness
+      faithfulnessScore = result.sources.length > 0 ? 60 : 30;
+    }
+
+    // Weighted overall: semantic 30% + faithfulness 20% + exact 20% + recall 15% + citation 15%
     const overallScore = (
-      (isCorrect ? 100 : semanticScore) * 0.3 +
-      semanticScore * 0.3 +
-      recallScore * 0.2 +
-      citationScore * 0.2
+      semanticScore * 0.30 +
+      faithfulnessScore * 0.20 +
+      (isCorrect ? 100 : semanticScore) * 0.20 +
+      recallScore * 0.15 +
+      citationScore * 0.15
     );
 
-    const reason = `精确匹配: ${isCorrect ? '✓' : '✗'} | 语义: ${Math.round(semanticScore)}% | 召回: ${Math.round(recallScore)}% | 引用: ${Math.round(citationScore)}%`;
+    const reason = [
+      `精确匹配: ${isCorrect ? '✓' : '✗'}`,
+      `语义: ${Math.round(semanticScore)}%`,
+      `忠实: ${Math.round(faithfulnessScore)}%`,
+      `召回: ${Math.round(recallScore)}%`,
+      `引用: ${Math.round(citationScore)}%`,
+    ].join(' | ');
 
-    return { overallScore, isCorrect, semanticScore, recallScore, citationScore, reason };
+    return { overallScore, isCorrect, semanticScore, recallScore, citationScore, faithfulnessScore, reason };
+  }
+
+  /**
+   * 构建 faithfulness 检测所需的 context 文本（拼接 chunk 内容）
+   */
+  private buildContextForFaithfulness(
+    sources: { chunkContent?: string; documentTitle?: string; relevanceScore: number }[]
+  ): string {
+    const parts: string[] = [];
+    for (const s of sources) {
+      if (s.chunkContent) {
+        const title = s.documentTitle ? `[${s.documentTitle}] ` : '';
+        parts.push(`${title}${s.chunkContent}`);
+      }
+    }
+    // Limit to ~6000 chars to keep LLM call manageable
+    const joined = parts.join('\n---\n');
+    return joined.length > 6000 ? joined.slice(0, 6000) + '...' : joined;
+  }
+
+  /**
+   * 文档级召回评分（当 reference_pages 为空时使用）
+   * 综合评估：是否检索到了相关文档 + 答案中的关键实体是否在 chunks 中出现
+   */
+  private computeDocumentRecall(
+    expected: string,
+    actual: string,
+    sources: { documentId: number; chunkContent?: string; relevanceScore: number }[]
+  ): number {
+    if (sources.length === 0) return 0;
+
+    // Factor 1: Source diversity and relevance (0-50)
+    const avgRelevance = sources.reduce((s, src) => s + src.relevanceScore, 0) / sources.length;
+    const relevanceFactor = Math.min(50, avgRelevance * 100);
+
+    // Factor 2: Key entity coverage — are key numbers/names from expected answer found in chunks? (0-50)
+    const keyEntities = this.extractKeyEntities(expected);
+    if (keyEntities.length === 0) {
+      // No extractable entities, use pure relevance
+      return Math.min(100, relevanceFactor * 2);
+    }
+
+    const chunkTexts = sources
+      .map(s => s.chunkContent || '')
+      .join(' ');
+    let found = 0;
+    for (const entity of keyEntities) {
+      if (chunkTexts.includes(entity)) found++;
+    }
+    const entityCoverage = (found / keyEntities.length) * 50;
+
+    return Math.min(100, Math.round(relevanceFactor + entityCoverage));
+  }
+
+  /**
+   * 从标准答案中提取关键实体（数字、专有名词等）
+   */
+  private extractKeyEntities(text: string): string[] {
+    const entities: string[] = [];
+
+    // Extract numbers with units (e.g., "7,771.02亿", "425.12万辆")
+    const numbers = text.match(/[\d,]+\.?\d*[亿万千百元%％辆台套件个]+/g);
+    if (numbers) {
+      for (const n of numbers) {
+        // Normalize: remove commas for matching
+        entities.push(n.replace(/,/g, ''));
+      }
+    }
+
+    // Extract pure numbers (e.g., "2100", "46.06")
+    const pureNums = text.match(/\d{4,}|\d+\.\d{2,}/g);
+    if (pureNums) {
+      for (const n of pureNums) {
+        if (!entities.some(e => e.includes(n))) {
+          entities.push(n);
+        }
+      }
+    }
+
+    // Extract Chinese proper nouns (company names, product names, etc.)
+    const cnNames = text.match(/[一-龥]{2,}(?:银行|电力|水泥|时代|华创|比亚迪|五粮液|证券|基金)/g);
+    if (cnNames) {
+      entities.push(...cnNames);
+    }
+
+    return [...new Set(entities)].slice(0, 15); // Deduplicate, max 15 entities
   }
 
   private fuzzyMatch(expected: string, actual: string): boolean {
     const normalize = (s: string) => s.replace(/[,，。.%％元亿万千百\s]/g, '').toLowerCase();
     const ne = normalize(expected);
     const na = normalize(actual);
-    if (na.includes(ne) || ne.includes(na)) return true;
+    if (ne.length > 3 && (na.includes(ne) || ne.includes(na))) return true;
 
     // Extract numbers and compare
     const numE = expected.match(/[\d,.]+/g);
     const numA = actual.match(/[\d,.]+/g);
     if (numE && numA) {
+      let matchCount = 0;
       for (const e of numE) {
+        const eClean = e.replace(/,/g, '');
+        if (eClean.length < 2) continue; // skip trivial numbers
         for (const a of numA) {
-          if (e.replace(/,/g, '') === a.replace(/,/g, '')) return true;
+          if (eClean === a.replace(/,/g, '')) { matchCount++; break; }
         }
+      }
+      // At least half of key numbers must match
+      const significantNums = numE.filter(e => e.replace(/,/g, '').length >= 2);
+      if (significantNums.length > 0 && matchCount >= Math.ceil(significantNums.length * 0.5)) {
+        return true;
       }
     }
 
@@ -832,20 +974,65 @@ ${chunkTexts}`;
     return Math.min(100, (overlap / wordsE.size) * 100);
   }
 
-  private async llmSemanticScore(question: string, expected: string, actual: string): Promise<number> {
+  /**
+   * 增强版语义评分 — 按题目类型差异化 prompt
+   */
+  private async llmSemanticScore(
+    question: string,
+    expected: string,
+    actual: string,
+    questionType: string,
+    difficulty: string
+  ): Promise<number> {
+    // Type-specific scoring criteria
+    let typeGuidance = '';
+    switch (questionType) {
+      case 'factual':
+      case 'number':
+      case 'name':
+        typeGuidance = `这是一道事实/数值型题目，评分重点：
+- 核心数字是否正确（允许四舍五入误差<5%）
+- 关键实体名称是否一致
+- 数值单位是否匹配（亿元 vs 万元）
+- 如果标准答案包含多个数据点，检查是否全部涵盖`;
+        break;
+      case 'comparative':
+        typeGuidance = `这是一道对比分析型题目，评分重点：
+- 是否涵盖了所有需要对比的对象
+- 对比维度是否完整（业务、财务、行业等）
+- 对比结论是否与标准答案一致
+- 是否有数据支撑对比结论`;
+        break;
+      case 'open':
+        typeGuidance = `这是一道开放分析型题目，评分重点：
+- 分析视角是否与标准答案的核心观点一致
+- 是否覆盖了标准答案中的关键论点（>=60%即可）
+- 分析是否有数据/事实支撑
+- 允许额外的合理分析，不因此扣分`;
+        break;
+      default:
+        typeGuidance = `评分重点：核心信息正确性、信息完整度、数据准确性`;
+    }
+
     const prompt = `评估以下 RAG 系统的回答质量。
 
-问题: ${question}
-标准答案: ${expected}
-模型回答: ${actual}
+【题目类型】${questionType} | 难度: ${difficulty}
+【评分要点】${typeGuidance}
 
-请只返回一个 0-100 的整数分数，不要返回其他内容。
+【问题】${question}
+【标准答案】${expected}
+【模型回答】${actual}
+
+请严格按照以下 JSON 格式返回，不要添加其他内容：
+{"score": <0-100整数>, "brief": "<一句话评分理由>"}
+
 评分标准：
-- 100: 完全正确且信息完整
-- 80-99: 核心信息正确但表述略有差异
-- 60-79: 部分正确
-- 40-59: 有部分相关信息但不够准确
-- 0-39: 错误或无关`;
+- 90-100: 核心信息完全正确且完整，数据准确
+- 75-89: 核心信息正确但有细微遗漏或表述差异
+- 60-74: 大部分正确但遗漏重要信息点
+- 40-59: 部分相关但关键数据缺失或有误
+- 20-39: 仅有少量相关信息
+- 0-19: 完全错误或答非所问`;
 
     const response = await fetch(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -854,22 +1041,94 @@ ${chunkTexts}`;
         'Authorization': `Bearer ${this.apiKey}`,
       },
       body: JSON.stringify({
-        model: 'gpt-4.1',
+        model: 'gpt-4.1-mini',
         messages: [
-          { role: 'system', content: '你是一个严格的 RAG 评估打分员。只返回 0-100 之间的整数分数。' },
+          { role: 'system', content: '你是专业的 RAG 系统评估员。请严格按照 JSON 格式返回评分结果。' },
           { role: 'user', content: prompt },
         ],
-        temperature: 0.3,
-        max_tokens: 10,
+        temperature: 0.2,
+        max_tokens: 100,
       }),
     });
 
-    if (!response.ok) throw new Error('LLM scoring failed');
+    if (!response.ok) throw new Error(`LLM scoring failed: ${response.status}`);
 
     const data = await response.json() as any;
     const content = (data.choices?.[0]?.message?.content || '').trim();
-    const score = parseInt(content, 10);
-    return isNaN(score) ? 50 : Math.min(100, Math.max(0, score));
+
+    // Parse JSON response
+    try {
+      const parsed = JSON.parse(content);
+      const score = parseInt(parsed.score, 10);
+      return isNaN(score) ? 50 : Math.min(100, Math.max(0, score));
+    } catch {
+      // Fallback: extract number from text
+      const numMatch = content.match(/(\d{1,3})/);
+      return numMatch ? Math.min(100, Math.max(0, parseInt(numMatch[1], 10))) : 50;
+    }
+  }
+
+  /**
+   * 忠实度评分 — 检测答案是否超出检索 context 的范围
+   * 核心问题: 模型是否"捏造"了 context 中不存在的信息?
+   */
+  private async llmFaithfulnessScore(
+    question: string,
+    answer: string,
+    context: string
+  ): Promise<number> {
+    const prompt = `你是 RAG 系统的忠实度审核员。请判断模型回答是否忠实于检索到的上下文。
+
+【问题】${question}
+
+【检索到的上下文】
+${context}
+
+【模型回答】
+${answer}
+
+请评估模型回答的忠实度，即回答中的信息是否都能在上下文中找到依据。
+
+请严格按照以下 JSON 格式返回：
+{"score": <0-100整数>, "issues": "<发现的忠实度问题，没问题则写'无'>"}
+
+评分标准：
+- 90-100: 回答完全基于上下文，所有数据和结论都有据可查
+- 70-89: 回答基本忠实，有少量合理推断但不超出上下文范围
+- 50-69: 回答部分基于上下文，但添加了一些上下文中没有的信息
+- 30-49: 回答中有较多信息在上下文中找不到依据
+- 0-29: 回答严重偏离上下文，大量捏造信息`;
+
+    const response = await fetch(`${this.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4.1-mini',
+        messages: [
+          { role: 'system', content: '你是 RAG 忠实度检测专家。严格按照 JSON 格式返回结果。' },
+          { role: 'user', content: prompt },
+        ],
+        temperature: 0.2,
+        max_tokens: 150,
+      }),
+    });
+
+    if (!response.ok) throw new Error(`Faithfulness scoring failed: ${response.status}`);
+
+    const data = await response.json() as any;
+    const content = (data.choices?.[0]?.message?.content || '').trim();
+
+    try {
+      const parsed = JSON.parse(content);
+      const score = parseInt(parsed.score, 10);
+      return isNaN(score) ? 50 : Math.min(100, Math.max(0, score));
+    } catch {
+      const numMatch = content.match(/(\d{1,3})/);
+      return numMatch ? Math.min(100, Math.max(0, parseInt(numMatch[1], 10))) : 50;
+    }
   }
 
   // ============================================================
