@@ -48,7 +48,7 @@
   // - AKSHARE_PROXY_URL: http://47.110.92.210:8000
   // - VECTORENGINE_API_KEY, TUSHARE_TOKEN, JWT_SECRET 等
   // - MINERU_API_KEY: MinerU PDF智能解析 (上海AI实验室 OpenDataLab)
-  // - DASHSCOPE_API_KEY: 阿里云百炼 (通义千问 text-embedding-v4 向量化)
+  // - DASHSCOPE_API_KEY: 阿里云百炼 (通义千问 text-embedding-v4 向量化, 1024维, 中文优化)
 
   // R2 存储（用于漫画图片等文件 - 后续添加）
   // "r2_buckets": [
