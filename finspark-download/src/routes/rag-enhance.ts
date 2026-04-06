@@ -409,10 +409,11 @@ ragEnhance.post('/evaluations/:id/run', async (c) => {
     const id = parseInt(c.req.param('id'));
     if (!id) return c.json({ success: false, error: '无效的评测 ID' }, 400);
 
-    // Check if already running
+    // Check status — allow resume for stalled 'running' evaluations
     const existing = await svc.getEvaluation(id);
-    if (existing.status === 'running') {
-      return c.json({ success: false, error: '评测任务正在运行中' }, 409);
+    const body = await c.req.json().catch(() => ({}));
+    if (existing.status === 'running' && !(body as any).resume) {
+      return c.json({ success: false, error: '评测任务正在运行中，传入 {"resume": true} 可恢复执行' }, 409);
     }
 
     // Run evaluation asynchronously via ctx.waitUntil if available
