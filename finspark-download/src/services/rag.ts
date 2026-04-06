@@ -963,10 +963,97 @@ export class RAGService {
     return scoredChunks.slice(0, topK);
   }
 
+  // ==================== FTS5 查询构建（用于混合检索 Stage 1）====================
+
+  // 金融领域复合词：unicode61 tokenizer 按字拆中文，需要短语匹配
+  private static readonly FINANCIAL_PHRASES = [
+    '营业收入', '净利润', '毛利率', '净利率', '营收增速',
+    '总资产', '净资产', '资产负债率', '流动比率', '速动比率',
+    '每股收益', '市盈率', '市净率', '股息率',
+    '经营现金流', '现金流量', '资本支出', '自由现金流',
+    '应收账款', '存货', '商誉', '无形资产', '长期借款',
+    '短期借款', '研发费用', '管理费用', '销售费用', '财务费用',
+    '研发投入', '营业利润', '利润总额', '归母净利润',
+    '同比增长', '环比增长', '同比下降', '环比下降',
+    '新能源', '汽车销量', '电动汽车', '动力电池', '储能',
+    '贵州茅台', '五粮液', '比亚迪', '宁德时代', '中国平安',
+    '招商银行', '中信证券', '海螺水泥', '紫金矿业', '长江电力',
+    '寒武纪', '北方华创', '迈瑞医疗', '中国石油', '立讯精密',
+    '年度报告', '招股说明书', '投资收益',
+  ];
+
+  /**
+   * 构建 FTS5 查询（用于混合检索的 Stage 1 预筛选）
+   * 
+   * 核心策略：
+   * 1. 识别金融复合词 → 短语匹配 "..."
+   * 2. 剩余文本按2-3字 ngram 切分
+   * 3. 所有 token 用 OR 连接（宽召回），由 Stage 2 向量精排
+   * 
+   * 示例：
+   *   "比亚迪新能源汽车销量" → '"比亚迪" OR "新能源" OR "汽车销量" OR 汽车 OR 销量'
+   *   "贵州茅台毛利率" → '"贵州茅台" OR "毛利率"'
+   */
+  private buildFTS5QueryForSearch(query: string): string {
+    if (!query || query.trim().length === 0) return '';
+
+    // 清洗 FTS5 特殊字符
+    let cleaned = query
+      .replace(/[""'']/g, '"')
+      .replace(/[(){}[\]^~*:]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!cleaned) return '';
+
+    const tokens: string[] = [];
+    let remaining = cleaned;
+
+    // Step 1: 提取金融复合词（按长度降序匹配，避免短词吃掉长词的一部分）
+    const sortedPhrases = [...RAGService.FINANCIAL_PHRASES].sort((a, b) => b.length - a.length);
+    for (const phrase of sortedPhrases) {
+      if (remaining.includes(phrase)) {
+        tokens.push(`"${phrase}"`);
+        remaining = remaining.replace(phrase, ' ');
+      }
+    }
+
+    // Step 2: 对剩余文本生成 2-3 字的中文 ngram
+    remaining = remaining.replace(/\s+/g, '').trim();
+    if (remaining.length > 0) {
+      // 提取连续的中文字符段
+      const chineseSegments = remaining.match(/[\u4e00-\u9fff]+/g) || [];
+      for (const seg of chineseSegments) {
+        if (seg.length <= 3) {
+          // 短词直接作为 token
+          tokens.push(`"${seg}"`);
+        } else {
+          // 长段按 2 字 bigram 切分
+          for (let i = 0; i < seg.length - 1; i++) {
+            tokens.push(`"${seg.slice(i, i + 2)}"`);
+          }
+        }
+      }
+      // 提取数字+年等
+      const numTokens = remaining.match(/\d+[年月%％万亿]?/g) || [];
+      for (const nt of numTokens) {
+        if (nt.length >= 2) tokens.push(nt);
+      }
+    }
+
+    // 去重
+    const unique = [...new Set(tokens)];
+    if (unique.length === 0) return cleaned; // fallback: 原始文本
+
+    // 用 OR 连接（宽召回）
+    return unique.join(' OR ');
+  }
+
   /**
    * 两阶段混合检索（替代原 KV 全扫方案）
    * 
    * Stage 1: FTS5 全文检索预筛选候选 chunk（~10ms，返回 topK*10 条）
+   *          使用 OR 逻辑 + 金融复合词短语匹配，解决中文分词问题
    * Stage 2: 对候选 chunk 生成 query embedding + 从 KV 加载 chunk embedding，
    *          计算 cosine similarity 并重排序
    * 
@@ -976,7 +1063,7 @@ export class RAGService {
    * - 兼顾关键词匹配（BM25）和语义相似度（向量）
    * 
    * 降级策略：
-   * - FTS5 失败时回退到有限 D1 查询（LIMIT 200）
+   * - FTS5 失败时：从每个文档均匀采样 chunks，确保跨文档覆盖
    */
   private async searchSimilarKV(
     query: string,
@@ -998,12 +1085,8 @@ export class RAGService {
     let candidates: any[] = [];
     
     try {
-      // 构建 FTS5 查询：清洗特殊字符
-      const ftsQuery = query
-        .replace(/[""'']/g, '"')
-        .replace(/[(){}[\]^~*:]/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
+      // 构建 FTS5 查询：使用 OR 逻辑 + 金融复合词短语匹配
+      const ftsQuery = this.buildFTS5QueryForSearch(query);
       
       if (ftsQuery) {
         let ftsSql = `
@@ -1040,21 +1123,24 @@ export class RAGService {
         
         const ftsResult = await this.db.prepare(ftsSql).bind(...ftsBinds).all();
         candidates = ftsResult.results || [];
-        console.log(`[RAG] FTS5 pre-filter: ${candidates.length} candidates for query "${query.slice(0, 30)}"`);
+        console.log(`[RAG] FTS5 pre-filter: ${candidates.length} candidates for query "${query.slice(0, 30)}" (fts: ${ftsQuery.slice(0, 60)})`);
       }
     } catch (ftsError) {
-      console.warn('[RAG] FTS5 pre-filter failed, falling back to D1 LIMIT query:', ftsError);
+      console.warn('[RAG] FTS5 pre-filter failed, falling back to sampled D1 query:', ftsError);
     }
     
-    // 降级：FTS5 失败或无结果时，使用 D1 带 LIMIT 查询（随机取一批 chunk）
+    // 降级：FTS5 失败或无结果时，从每个文档均匀采样
+    // 确保跨文档覆盖，避免结果全部来自单一文档
     if (candidates.length === 0) {
-      const D1_FALLBACK_LIMIT = Math.max(topK * 20, 200);
+      const SAMPLES_PER_DOC = Math.max(Math.ceil(200 / 14), 15); // ~15 per doc
       let sql = `
-        SELECT c.id, c.document_id, c.chunk_index, c.content, c.content_length, c.embedding_key, c.metadata,
-               d.title as document_title
-        FROM rag_chunks c
-        JOIN rag_documents d ON c.document_id = d.id
-        WHERE c.has_embedding = 1 AND d.status = 'completed'
+        WITH ranked AS (
+          SELECT c.id, c.document_id, c.chunk_index, c.content, c.content_length, 
+                 c.embedding_key, c.metadata, d.title as document_title,
+                 ROW_NUMBER() OVER (PARTITION BY c.document_id ORDER BY RANDOM()) as rn
+          FROM rag_chunks c
+          JOIN rag_documents d ON c.document_id = d.id
+          WHERE c.has_embedding = 1 AND d.status = 'completed'
       `;
       const bindParams: any[] = [];
       
@@ -1071,13 +1157,13 @@ export class RAGService {
         bindParams.push(category);
       }
       
-      sql += ` LIMIT ?`;
-      bindParams.push(D1_FALLBACK_LIMIT);
+      sql += `) SELECT * FROM ranked WHERE rn <= ?`;
+      bindParams.push(SAMPLES_PER_DOC);
       
       const stmt = this.db.prepare(sql).bind(...bindParams);
       const result = await stmt.all();
       candidates = result.results || [];
-      console.log(`[RAG] D1 fallback: ${candidates.length} candidates`);
+      console.log(`[RAG] Sampled fallback: ${candidates.length} candidates from multiple docs`);
     }
     
     if (candidates.length === 0) {
