@@ -108,7 +108,7 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy dist --project-name=genspark-financial-analysis --branch=preview
+          command: pages deploy dist --project-name=finspark-financial --branch=preview
           workingDirectory: finspark-download
 
   deploy-production:
@@ -150,5 +150,5 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy dist --project-name=genspark-financial-analysis
+          command: pages deploy dist --project-name=finspark-financial
           workingDirectory: finspark-download
