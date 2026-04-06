@@ -594,21 +594,18 @@ ragOps.post('/admin/apply-migration', async (c) => {
   }
 });
 
-// ==================== 文档 Rechunk API ====================
+// ==================== 文档 Rechunk API (分阶段) ====================
 
 /**
- * POST /rechunk/:documentId — 对已有文档重新切片
+ * POST /rechunk/:documentId — 对已有文档重新切片（分阶段执行，适应 Workers CPU 限制）
  * 
- * 流程：
- * 1. 读取文档的所有现有 chunks，拼接为完整文本
- * 2. 用新的 extractStructuredBlocks + buildStructuredChunksV2 重新切片
- * 3. 删除旧 chunks 和 embeddings
- * 4. 写入新 chunks
- * 5. 批量生成新 embeddings
+ * 阶段设计：
+ * - phase=1 (默认): 分批读取旧 chunks → 拼接 → 存入 KV 缓存
+ * - phase=2: 从 KV 读取原文 → 重新切片 → 删除旧 chunks → 写入新 chunks
+ * - phase=3: 为未嵌入的 chunks 生成 embeddings（每次一批 20 个）
+ * - dryRun=true: 只预览（在 phase=1 时执行完整预览）
  * 
- * Query params:
- * - dryRun=true : 只预览新切片结果，不实际修改
- * - skipEmbedding=true : 只切片不生成 embedding（后续由 auto-sync advance 补充）
+ * 每个阶段在单次请求内完成，客户端需连续调用直到返回 done=true
  */
 ragOps.post('/rechunk/:documentId', async (c) => {
   try {
@@ -617,13 +614,15 @@ ragOps.post('/rechunk/:documentId', async (c) => {
       return c.json({ success: false, error: 'Invalid document ID' }, 400);
     }
 
+    const phase = parseInt(c.req.query('phase') || '1', 10);
     const dryRun = c.req.query('dryRun') === 'true';
     const skipEmbedding = c.req.query('skipEmbedding') === 'true';
 
     const db = c.env.DB;
     const kv = c.env.CACHE;
+    const kvKey = `rechunk:content:${documentId}`;
 
-    // 1. 获取文档信息
+    // 获取文档信息
     const doc = await db.prepare(
       'SELECT id, title, file_name, file_type, stock_code, stock_name, category, tags, status FROM rag_documents WHERE id = ?'
     ).bind(documentId).first<Record<string, unknown>>();
@@ -632,191 +631,271 @@ ragOps.post('/rechunk/:documentId', async (c) => {
       return c.json({ success: false, error: 'Document not found' }, 404);
     }
 
-    // 2. 读取现有 chunks 拼接原文
-    const existingChunks = await db.prepare(
-      'SELECT content, chunk_index, chunk_type FROM rag_chunks WHERE document_id = ? ORDER BY chunk_index ASC'
-    ).bind(documentId).all();
+    // ==================== Phase 1: 读取旧 chunks → 拼接 → 存 KV ====================
+    if (phase === 1) {
+      // 检查 KV 是否已有缓存（支持幂等重试）
+      const existing = await kv.get(kvKey);
+      if (existing) {
+        const oldCount = await db.prepare(
+          'SELECT COUNT(*) as cnt FROM rag_chunks WHERE document_id = ?'
+        ).bind(documentId).first<{ cnt: number }>();
 
-    if (!existingChunks.results || existingChunks.results.length === 0) {
-      return c.json({ success: false, error: 'No chunks found for this document' }, 404);
+        // 如果是 dryRun，直接用 KV 中的内容做预览
+        if (dryRun) {
+          const structuredBlocks = extractStructuredBlocks(existing);
+          const newChunks = buildStructuredChunksV2(structuredBlocks, {
+            chunkSize: 800, chunkOverlap: 50,
+            fileName: doc.file_name as string || '',
+            stockCode: doc.stock_code as string || '',
+            category: doc.category as string || '',
+          });
+          return c.json({
+            success: true, dryRun: true, documentId, title: doc.title,
+            old: { chunkCount: oldCount?.cnt || 0 },
+            new: {
+              chunkCount: newChunks.length,
+              types: {
+                text: newChunks.filter(ch => ch.meta.chunkType === 'text').length,
+                table: newChunks.filter(ch => ch.meta.chunkType === 'table').length,
+              },
+              avgLength: Math.round(newChunks.reduce((s, ch) => s + ch.text.length, 0) / (newChunks.length || 1)),
+              hasHeadings: newChunks.some(ch => ch.meta.heading),
+              hasPages: newChunks.some(ch => ch.meta.pageStart && ch.meta.pageStart > 1),
+            },
+            sampleChunks: newChunks.slice(0, 3).map((ch, i) => ({
+              index: i, length: ch.text.length, type: ch.meta.chunkType,
+              heading: ch.meta.heading, preview: ch.text.slice(0, 150),
+            })),
+          });
+        }
+
+        return c.json({
+          success: true, phase: 1, status: 'cached',
+          documentId, title: doc.title,
+          contentLength: existing.length,
+          oldChunkCount: oldCount?.cnt || 0,
+          nextPhase: 2,
+          message: 'Content already in KV, proceed to phase 2',
+        });
+      }
+
+      // 分批读取 chunks（每次 500 条），拼接
+      const contentParts: string[] = [];
+      let offset = 0;
+      const PAGE_SIZE = 500;
+      let totalRead = 0;
+
+      while (true) {
+        const batch = await db.prepare(
+          'SELECT content FROM rag_chunks WHERE document_id = ? ORDER BY chunk_index ASC LIMIT ? OFFSET ?'
+        ).bind(documentId, PAGE_SIZE, offset).all();
+
+        if (!batch.results || batch.results.length === 0) break;
+
+        for (const row of batch.results) {
+          contentParts.push((row as any).content as string);
+        }
+        totalRead += batch.results.length;
+        offset += PAGE_SIZE;
+
+        // 安全阀：最多读 5000 条（防止超时）
+        if (totalRead >= 5000) break;
+      }
+
+      if (contentParts.length === 0) {
+        return c.json({ success: false, error: 'No chunks found for this document' }, 404);
+      }
+
+      const fullContent = contentParts.join('\n');
+
+      // 存入 KV（TTL 1 小时）
+      await kv.put(kvKey, fullContent, { expirationTtl: 3600 });
+
+      if (dryRun) {
+        const structuredBlocks = extractStructuredBlocks(fullContent);
+        const newChunks = buildStructuredChunksV2(structuredBlocks, {
+          chunkSize: 800, chunkOverlap: 50,
+          fileName: doc.file_name as string || '',
+          stockCode: doc.stock_code as string || '',
+          category: doc.category as string || '',
+        });
+        return c.json({
+          success: true, dryRun: true, documentId, title: doc.title,
+          old: { chunkCount: totalRead },
+          new: {
+            chunkCount: newChunks.length,
+            types: {
+              text: newChunks.filter(ch => ch.meta.chunkType === 'text').length,
+              table: newChunks.filter(ch => ch.meta.chunkType === 'table').length,
+            },
+            avgLength: Math.round(newChunks.reduce((s, ch) => s + ch.text.length, 0) / (newChunks.length || 1)),
+            hasHeadings: newChunks.some(ch => ch.meta.heading),
+            hasPages: newChunks.some(ch => ch.meta.pageStart && ch.meta.pageStart > 1),
+            structuredBlocks: structuredBlocks.length,
+          },
+          sampleChunks: newChunks.slice(0, 5).map((ch, i) => ({
+            index: i, length: ch.text.length, type: ch.meta.chunkType,
+            heading: ch.meta.heading,
+            pageRange: ch.meta.pageStart ? `${ch.meta.pageStart}-${ch.meta.pageEnd || ch.meta.pageStart}` : null,
+            preview: ch.text.slice(0, 200),
+          })),
+        });
+      }
+
+      return c.json({
+        success: true, phase: 1, status: 'content_cached',
+        documentId, title: doc.title,
+        contentLength: fullContent.length,
+        oldChunkCount: totalRead,
+        nextPhase: 2,
+        message: `Read ${totalRead} chunks (${fullContent.length} chars) → stored in KV. Call phase=2 next.`,
+      });
     }
 
-    const oldChunkCount = existingChunks.results.length;
-    const oldChunkTypes = {
-      text: existingChunks.results.filter((c: any) => (c.chunk_type || 'text') === 'text').length,
-      table: existingChunks.results.filter((c: any) => c.chunk_type === 'table').length,
-      heading: existingChunks.results.filter((c: any) => c.chunk_type === 'heading').length,
-    };
+    // ==================== Phase 2: 从 KV 读取 → 重新切片 → 写入 ====================
+    if (phase === 2) {
+      const fullContent = await kv.get(kvKey);
+      if (!fullContent) {
+        return c.json({ success: false, error: 'KV cache missing, run phase=1 first' }, 400);
+      }
 
-    // 拼接所有 text chunks 为原文（跳过 table HTML 以避免重复）
-    const fullContent = existingChunks.results
-      .map((c: any) => c.content)
-      .join('\n');
+      const fileName = doc.file_name as string || '';
+      const stockCode = doc.stock_code as string || '';
+      const category = doc.category as string || '';
 
-    // 3. 用新算法重新切片
-    const structuredBlocks = extractStructuredBlocks(fullContent);
-    const fileName = doc.file_name as string || '';
-    const stockCode = doc.stock_code as string || '';
-    const category = doc.category as string || '';
+      // 重新切片
+      const structuredBlocks = extractStructuredBlocks(fullContent);
+      const newChunks = buildStructuredChunksV2(structuredBlocks, {
+        chunkSize: 800, chunkOverlap: 50, fileName, stockCode, category,
+      });
 
-    const newChunks = buildStructuredChunksV2(structuredBlocks, {
-      chunkSize: 800,
-      chunkOverlap: 50,
-      fileName,
-      stockCode,
-      category,
-    });
+      // 删除旧 chunks（不删 KV embeddings — 太慢，让它们自然过期或后续清理）
+      await db.prepare('DELETE FROM rag_chunks WHERE document_id = ?').bind(documentId).run();
 
-    const newChunkTypes = {
-      text: newChunks.filter(c => c.meta.chunkType === 'text').length,
-      table: newChunks.filter(c => c.meta.chunkType === 'table').length,
-      heading: newChunks.filter(c => c.meta.chunkType === 'heading').length,
-    };
+      // 写入新 chunks（不含 embedding）
+      const BATCH = 50;
+      for (let i = 0; i < newChunks.length; i += BATCH) {
+        const batch = newChunks.slice(i, i + BATCH);
+        const stmts = batch.map((ch, idx) => {
+          const chunkIdx = i + idx;
+          const pageRange = ch.meta.pageStart
+            ? (ch.meta.pageEnd && ch.meta.pageEnd !== ch.meta.pageStart
+              ? `${ch.meta.pageStart}-${ch.meta.pageEnd}` : `${ch.meta.pageStart}`)
+            : null;
+          return db.prepare(`
+            INSERT INTO rag_chunks (document_id, chunk_index, content, content_length, embedding_key, has_embedding, metadata, chunk_type, page_range)
+            VALUES (?, ?, ?, ?, '', 0, ?, ?, ?)
+          `).bind(
+            documentId, chunkIdx, ch.text, ch.text.length,
+            JSON.stringify(ch.meta), ch.meta.chunkType || 'text', pageRange
+          );
+        });
+        await db.batch(stmts);
+      }
 
-    const avgLength = Math.round(newChunks.reduce((s, c) => s + c.text.length, 0) / (newChunks.length || 1));
-    const hasHeadings = newChunks.some(c => c.meta.heading);
-    const hasPages = newChunks.some(c => c.meta.pageStart && c.meta.pageStart > 1);
+      // 更新文档 chunk_count
+      await db.prepare(
+        'UPDATE rag_documents SET chunk_count = ?, updated_at = datetime(\'now\') WHERE id = ?'
+      ).bind(newChunks.length, documentId).run();
 
-    // Dry run - 只返回预览
-    if (dryRun) {
+      // 清理 KV 缓存
+      await kv.delete(kvKey);
+
+      const newChunkTypes = {
+        text: newChunks.filter(ch => ch.meta.chunkType === 'text').length,
+        table: newChunks.filter(ch => ch.meta.chunkType === 'table').length,
+      };
+
       return c.json({
-        success: true,
-        dryRun: true,
-        documentId,
-        title: doc.title,
-        old: { chunkCount: oldChunkCount, types: oldChunkTypes },
+        success: true, phase: 2, status: 'rechunked',
+        documentId, title: doc.title,
         new: {
           chunkCount: newChunks.length,
           types: newChunkTypes,
-          avgLength,
-          hasHeadings,
-          hasPages,
-          structuredBlocks: structuredBlocks.length,
-          blockTypes: {
-            text: structuredBlocks.filter(b => b.type === 'text').length,
-            table: structuredBlocks.filter(b => b.type === 'table').length,
-            heading: structuredBlocks.filter(b => b.type === 'heading').length,
-          },
+          avgLength: Math.round(newChunks.reduce((s, ch) => s + ch.text.length, 0) / (newChunks.length || 1)),
+          hasHeadings: newChunks.some(ch => ch.meta.heading),
+          hasPages: newChunks.some(ch => ch.meta.pageStart && ch.meta.pageStart > 1),
         },
-        sampleChunks: newChunks.slice(0, 5).map((c, i) => ({
-          index: i,
-          length: c.text.length,
-          type: c.meta.chunkType,
-          heading: c.meta.heading,
-          pageRange: c.meta.pageStart ? `${c.meta.pageStart}-${c.meta.pageEnd || c.meta.pageStart}` : null,
-          preview: c.text.slice(0, 200),
-        })),
+        nextPhase: skipEmbedding ? null : 3,
+        done: skipEmbedding,
+        message: skipEmbedding
+          ? `Rechunked: ${newChunks.length} new chunks (no embedding). Done.`
+          : `Rechunked: ${newChunks.length} new chunks. Call phase=3 to generate embeddings.`,
       });
     }
 
-    // 4. 删除旧 chunks 和 KV embeddings
-    // 先获取旧的 embedding keys
-    const oldEmbeddings = await db.prepare(
-      'SELECT embedding_key FROM rag_chunks WHERE document_id = ? AND embedding_key IS NOT NULL AND embedding_key != \'\''
-    ).bind(documentId).all();
-
-    // 删除 KV 中的 embeddings
-    let kvDeleteCount = 0;
-    if (oldEmbeddings.results) {
-      for (const row of oldEmbeddings.results) {
-        const key = (row as any).embedding_key as string;
-        if (key) {
-          try { await kv.delete(key); kvDeleteCount++; } catch {}
-        }
-      }
-    }
-
-    // 删除旧 chunks
-    await db.prepare('DELETE FROM rag_chunks WHERE document_id = ?').bind(documentId).run();
-
-    // 5. 写入新 chunks
-    const BATCH = 50;
-    for (let i = 0; i < newChunks.length; i += BATCH) {
-      const batch = newChunks.slice(i, i + BATCH);
-      const stmts = batch.map((c, idx) => {
-        const chunkIdx = i + idx;
-        const pageRange = c.meta.pageStart
-          ? (c.meta.pageEnd && c.meta.pageEnd !== c.meta.pageStart
-            ? `${c.meta.pageStart}-${c.meta.pageEnd}` : `${c.meta.pageStart}`)
-          : null;
-        return db.prepare(`
-          INSERT INTO rag_chunks (document_id, chunk_index, content, content_length, embedding_key, has_embedding, metadata, chunk_type, page_range)
-          VALUES (?, ?, ?, ?, '', 0, ?, ?, ?)
-        `).bind(
-          documentId, chunkIdx, c.text, c.text.length,
-          JSON.stringify(c.meta), c.meta.chunkType || 'text', pageRange
-        );
-      });
-      await db.batch(stmts);
-    }
-
-    // 6. 生成 embeddings（如果不跳过）
-    let embeddingCount = 0;
-    if (!skipEmbedding) {
+    // ==================== Phase 3: 批量生成 embeddings ====================
+    if (phase === 3) {
       const dashscopeKey = c.env.DASHSCOPE_API_KEY;
       const vectorengineKey = c.env.VECTORENGINE_API_KEY;
 
-      if (dashscopeKey || vectorengineKey) {
-        const embeddingConfig = createEmbeddingConfig({
-          dashscopeApiKey: dashscopeKey,
-          vectorengineApiKey: vectorengineKey,
-        });
-
-        const EMBED_BATCH = embeddingConfig.batchSize;
-        for (let i = 0; i < newChunks.length; i += EMBED_BATCH) {
-          const batchItems = newChunks.slice(i, i + EMBED_BATCH);
-          const batchTexts = batchItems.map(item => item.text);
-
-          try {
-            const embeddings = await generateEmbeddings(batchTexts, embeddingConfig);
-
-            const stmts: D1PreparedStatement[] = [];
-            for (let j = 0; j < batchItems.length; j++) {
-              const chunkIdx = i + j;
-              const embeddingKey = `rag:emb:${documentId}:${chunkIdx}`;
-              await kv.put(embeddingKey, JSON.stringify(embeddings[j]));
-
-              stmts.push(
-                db.prepare(
-                  'UPDATE rag_chunks SET embedding_key = ?, has_embedding = 1 WHERE document_id = ? AND chunk_index = ?'
-                ).bind(embeddingKey, documentId, chunkIdx)
-              );
-            }
-            await db.batch(stmts);
-            embeddingCount += batchItems.length;
-          } catch (embError) {
-            console.error(`[Rechunk] Embedding batch ${Math.floor(i / EMBED_BATCH) + 1} failed:`, embError);
-            // 继续处理，后续可通过 auto-sync advance 补充
-          }
-        }
+      if (!dashscopeKey && !vectorengineKey) {
+        return c.json({ success: false, error: 'No embedding API key configured' }, 400);
       }
+
+      const embeddingConfig = createEmbeddingConfig({
+        dashscopeApiKey: dashscopeKey,
+        vectorengineApiKey: vectorengineKey,
+      });
+
+      // 找到下一批未嵌入的 chunks
+      const EMBED_BATCH = 20;
+      const unembedded = await db.prepare(
+        `SELECT id, chunk_index, content FROM rag_chunks 
+         WHERE document_id = ? AND has_embedding = 0 
+         ORDER BY chunk_index ASC LIMIT ?`
+      ).bind(documentId, EMBED_BATCH).all();
+
+      if (!unembedded.results || unembedded.results.length === 0) {
+        // 全部嵌入完成
+        const totalChunks = await db.prepare(
+          'SELECT COUNT(*) as cnt FROM rag_chunks WHERE document_id = ?'
+        ).bind(documentId).first<{ cnt: number }>();
+
+        return c.json({
+          success: true, phase: 3, status: 'embedding_complete',
+          documentId, title: doc.title,
+          totalChunks: totalChunks?.cnt || 0,
+          done: true,
+          message: 'All chunks embedded. Rechunk complete.',
+        });
+      }
+
+      const batchTexts = unembedded.results.map((r: any) => r.content as string);
+      const embeddings = await generateEmbeddings(batchTexts, embeddingConfig);
+
+      const stmts: D1PreparedStatement[] = [];
+      for (let j = 0; j < unembedded.results.length; j++) {
+        const row = unembedded.results[j] as any;
+        const embeddingKey = `rag:emb:${documentId}:${row.chunk_index}`;
+        await kv.put(embeddingKey, JSON.stringify(embeddings[j]));
+        stmts.push(
+          db.prepare(
+            'UPDATE rag_chunks SET embedding_key = ?, has_embedding = 1 WHERE id = ?'
+          ).bind(embeddingKey, row.id)
+        );
+      }
+      await db.batch(stmts);
+
+      // 还剩多少未嵌入
+      const remaining = await db.prepare(
+        'SELECT COUNT(*) as cnt FROM rag_chunks WHERE document_id = ? AND has_embedding = 0'
+      ).bind(documentId).first<{ cnt: number }>();
+
+      const remainingCount = remaining?.cnt || 0;
+
+      return c.json({
+        success: true, phase: 3, status: 'embedding_progress',
+        documentId, title: doc.title,
+        embedded: unembedded.results.length,
+        remaining: remainingCount,
+        done: remainingCount === 0,
+        nextPhase: remainingCount > 0 ? 3 : null,
+        message: `Embedded ${unembedded.results.length} chunks. ${remainingCount} remaining.`,
+      });
     }
 
-    // 7. 更新文档 chunk_count
-    await db.prepare(
-      'UPDATE rag_documents SET chunk_count = ?, updated_at = datetime(\'now\') WHERE id = ?'
-    ).bind(newChunks.length, documentId).run();
-
-    return c.json({
-      success: true,
-      documentId,
-      title: doc.title,
-      old: { chunkCount: oldChunkCount, types: oldChunkTypes, kvDeleted: kvDeleteCount },
-      new: {
-        chunkCount: newChunks.length,
-        types: newChunkTypes,
-        avgLength,
-        hasHeadings,
-        hasPages,
-        embeddingsGenerated: embeddingCount,
-      },
-      improvement: {
-        chunkCountChange: newChunks.length - oldChunkCount,
-        tablesPreserved: newChunkTypes.table,
-        headingsDetected: hasHeadings,
-        pagesEstimated: hasPages,
-      },
-    });
+    return c.json({ success: false, error: `Unknown phase: ${phase}` }, 400);
 
   } catch (error) {
     console.error('[Rechunk] Error:', error);
@@ -828,20 +907,11 @@ ragOps.post('/rechunk/:documentId', async (c) => {
 });
 
 /**
- * POST /rechunk-all — 对所有文档重新切片
- * 
- * 逐个调用 rechunk 逻辑，避免超时
- * Query params:
- * - dryRun=true : 只预览
- * - skipEmbedding=true : 跳过 embedding
- * - limit=N : 最多处理 N 个文档（默认全部）
+ * POST /rechunk-all — 列出所有待 rechunk 文档
  */
 ragOps.post('/rechunk-all', async (c) => {
   try {
-    const dryRun = c.req.query('dryRun') === 'true';
-    const skipEmbedding = c.req.query('skipEmbedding') === 'true';
     const limit = parseInt(c.req.query('limit') || '100', 10);
-
     const db = c.env.DB;
 
     const docs = await db.prepare(
@@ -852,30 +922,18 @@ ragOps.post('/rechunk-all', async (c) => {
       return c.json({ success: true, message: 'No documents to rechunk', processed: 0 });
     }
 
-    // 由于 Cloudflare Workers 有 CPU 时间限制，这里只返回文档列表和预览
-    // 实际 rechunk 需要逐个调用 /rechunk/:documentId
-    const docList = docs.results.map((d: any) => ({
-      id: d.id,
-      title: d.title,
-      stockCode: d.stock_code,
-      currentChunks: d.chunk_count,
-    }));
-
     return c.json({
       success: true,
-      message: dryRun
-        ? 'Dry run: listing documents that would be rechunked'
-        : 'Use POST /rechunk/:documentId to rechunk each document individually (Workers CPU limit)',
-      totalDocuments: docList.length,
-      documents: docList,
-      instructions: 'Call POST /api/rag/ops/rechunk/{documentId}?skipEmbedding=true for each document, then use auto-sync advance to generate embeddings',
+      totalDocuments: docs.results.length,
+      documents: docs.results.map((d: any) => ({
+        id: d.id, title: d.title, stockCode: d.stock_code, currentChunks: d.chunk_count,
+      })),
+      instructions: 'For each document: call phase=1, then phase=2 (skipEmbedding=true), then optionally phase=3 (loop until done=true)',
+      example: 'POST /api/rag/ops/rechunk/{id}?phase=1 → POST /api/rag/ops/rechunk/{id}?phase=2&skipEmbedding=true',
     });
 
   } catch (error) {
-    return c.json({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to list documents',
-    }, 500);
+    return c.json({ success: false, error: error instanceof Error ? error.message : 'Failed' }, 500);
   }
 });
 
