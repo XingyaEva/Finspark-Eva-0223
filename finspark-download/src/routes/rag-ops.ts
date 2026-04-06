@@ -771,9 +771,12 @@ ragOps.post('/rechunk/:documentId', async (c) => {
 
       // 删除旧 chunks（不删 KV embeddings — 太慢，让它们自然过期或后续清理）
       await db.prepare('DELETE FROM rag_chunks WHERE document_id = ?').bind(documentId).run();
+      console.log(`[Rechunk] Deleted old chunks for doc ${documentId}`);
 
       // 写入新 chunks（不含 embedding）
-      const BATCH = 50;
+      // 使用较小的批次（10条/批）避免 D1 payload 限制（表格 HTML 可能很大）
+      const BATCH = 10;
+      let writeErrors = 0;
       for (let i = 0; i < newChunks.length; i += BATCH) {
         const batch = newChunks.slice(i, i + BATCH);
         const stmts = batch.map((ch, idx) => {
@@ -782,21 +785,42 @@ ragOps.post('/rechunk/:documentId', async (c) => {
             ? (ch.meta.pageEnd && ch.meta.pageEnd !== ch.meta.pageStart
               ? `${ch.meta.pageStart}-${ch.meta.pageEnd}` : `${ch.meta.pageStart}`)
             : null;
+          // 限制 content 长度以避免超出 D1 限制
+          const content = ch.text.length > 50000 ? ch.text.slice(0, 50000) + '...(truncated)' : ch.text;
+          const metaStr = JSON.stringify(ch.meta);
           return db.prepare(`
             INSERT INTO rag_chunks (document_id, chunk_index, content, content_length, embedding_key, has_embedding, metadata, chunk_type, page_range)
             VALUES (?, ?, ?, ?, '', 0, ?, ?, ?)
           `).bind(
-            documentId, chunkIdx, ch.text, ch.text.length,
-            JSON.stringify(ch.meta), ch.meta.chunkType || 'text', pageRange
+            documentId, chunkIdx, content, content.length,
+            metaStr, ch.meta.chunkType || 'text', pageRange
           );
         });
-        await db.batch(stmts);
+        try {
+          await db.batch(stmts);
+        } catch (batchErr) {
+          console.error(`[Rechunk] Batch ${Math.floor(i / BATCH) + 1} failed for doc ${documentId}:`, batchErr);
+          writeErrors++;
+          // 尝试逐条写入
+          for (const stmt of stmts) {
+            try {
+              await stmt.run();
+            } catch (singleErr) {
+              console.error(`[Rechunk] Single insert failed:`, singleErr);
+              writeErrors++;
+            }
+          }
+        }
       }
 
       // 更新文档 chunk_count
+      const actualCount = await db.prepare(
+        'SELECT COUNT(*) as cnt FROM rag_chunks WHERE document_id = ?'
+      ).bind(documentId).first<{ cnt: number }>();
+      
       await db.prepare(
         'UPDATE rag_documents SET chunk_count = ?, updated_at = datetime(\'now\') WHERE id = ?'
-      ).bind(newChunks.length, documentId).run();
+      ).bind(actualCount?.cnt || newChunks.length, documentId).run();
 
       // 清理 KV 缓存
       await kv.delete(kvKey);
@@ -810,17 +834,19 @@ ragOps.post('/rechunk/:documentId', async (c) => {
         success: true, phase: 2, status: 'rechunked',
         documentId, title: doc.title,
         new: {
-          chunkCount: newChunks.length,
+          chunkCount: actualCount?.cnt || newChunks.length,
+          expectedCount: newChunks.length,
           types: newChunkTypes,
           avgLength: Math.round(newChunks.reduce((s, ch) => s + ch.text.length, 0) / (newChunks.length || 1)),
           hasHeadings: newChunks.some(ch => ch.meta.heading),
           hasPages: newChunks.some(ch => ch.meta.pageStart && ch.meta.pageStart > 1),
+          writeErrors,
         },
         nextPhase: skipEmbedding ? null : 3,
         done: skipEmbedding,
         message: skipEmbedding
-          ? `Rechunked: ${newChunks.length} new chunks (no embedding). Done.`
-          : `Rechunked: ${newChunks.length} new chunks. Call phase=3 to generate embeddings.`,
+          ? `Rechunked: ${actualCount?.cnt || newChunks.length} new chunks (no embedding). Done.`
+          : `Rechunked: ${actualCount?.cnt || newChunks.length} new chunks. Call phase=3 to generate embeddings.`,
       });
     }
 
