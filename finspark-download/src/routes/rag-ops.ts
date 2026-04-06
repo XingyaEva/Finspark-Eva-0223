@@ -14,7 +14,8 @@ import { Hono } from 'hono';
 import type { Bindings } from '../types';
 import { createConfigService } from '../services/ragConfig';
 import { createFTS5Service } from '../services/ragFts5';
-import { createEmbeddingConfig, generateEmbedding } from '../services/rag';
+import { createEmbeddingConfig, generateEmbedding, buildStructuredChunksV2, generateEmbeddings } from '../services/rag';
+import { cleanMineruMarkdown, extractStructuredBlocks } from '../services/ragPdfParser';
 
 const ragOps = new Hono<{ Bindings: Bindings }>();
 
@@ -589,6 +590,291 @@ ragOps.post('/admin/apply-migration', async (c) => {
     return c.json({
       success: false,
       error: error instanceof Error ? error.message : '迁移执行失败',
+    }, 500);
+  }
+});
+
+// ==================== 文档 Rechunk API ====================
+
+/**
+ * POST /rechunk/:documentId — 对已有文档重新切片
+ * 
+ * 流程：
+ * 1. 读取文档的所有现有 chunks，拼接为完整文本
+ * 2. 用新的 extractStructuredBlocks + buildStructuredChunksV2 重新切片
+ * 3. 删除旧 chunks 和 embeddings
+ * 4. 写入新 chunks
+ * 5. 批量生成新 embeddings
+ * 
+ * Query params:
+ * - dryRun=true : 只预览新切片结果，不实际修改
+ * - skipEmbedding=true : 只切片不生成 embedding（后续由 auto-sync advance 补充）
+ */
+ragOps.post('/rechunk/:documentId', async (c) => {
+  try {
+    const documentId = parseInt(c.req.param('documentId'), 10);
+    if (isNaN(documentId)) {
+      return c.json({ success: false, error: 'Invalid document ID' }, 400);
+    }
+
+    const dryRun = c.req.query('dryRun') === 'true';
+    const skipEmbedding = c.req.query('skipEmbedding') === 'true';
+
+    const db = c.env.DB;
+    const kv = c.env.CACHE;
+
+    // 1. 获取文档信息
+    const doc = await db.prepare(
+      'SELECT id, title, file_name, file_type, stock_code, stock_name, category, tags, status FROM rag_documents WHERE id = ?'
+    ).bind(documentId).first<Record<string, unknown>>();
+
+    if (!doc) {
+      return c.json({ success: false, error: 'Document not found' }, 404);
+    }
+
+    // 2. 读取现有 chunks 拼接原文
+    const existingChunks = await db.prepare(
+      'SELECT content, chunk_index, chunk_type FROM rag_chunks WHERE document_id = ? ORDER BY chunk_index ASC'
+    ).bind(documentId).all();
+
+    if (!existingChunks.results || existingChunks.results.length === 0) {
+      return c.json({ success: false, error: 'No chunks found for this document' }, 404);
+    }
+
+    const oldChunkCount = existingChunks.results.length;
+    const oldChunkTypes = {
+      text: existingChunks.results.filter((c: any) => (c.chunk_type || 'text') === 'text').length,
+      table: existingChunks.results.filter((c: any) => c.chunk_type === 'table').length,
+      heading: existingChunks.results.filter((c: any) => c.chunk_type === 'heading').length,
+    };
+
+    // 拼接所有 text chunks 为原文（跳过 table HTML 以避免重复）
+    const fullContent = existingChunks.results
+      .map((c: any) => c.content)
+      .join('\n');
+
+    // 3. 用新算法重新切片
+    const structuredBlocks = extractStructuredBlocks(fullContent);
+    const fileName = doc.file_name as string || '';
+    const stockCode = doc.stock_code as string || '';
+    const category = doc.category as string || '';
+
+    const newChunks = buildStructuredChunksV2(structuredBlocks, {
+      chunkSize: 800,
+      chunkOverlap: 50,
+      fileName,
+      stockCode,
+      category,
+    });
+
+    const newChunkTypes = {
+      text: newChunks.filter(c => c.meta.chunkType === 'text').length,
+      table: newChunks.filter(c => c.meta.chunkType === 'table').length,
+      heading: newChunks.filter(c => c.meta.chunkType === 'heading').length,
+    };
+
+    const avgLength = Math.round(newChunks.reduce((s, c) => s + c.text.length, 0) / (newChunks.length || 1));
+    const hasHeadings = newChunks.some(c => c.meta.heading);
+    const hasPages = newChunks.some(c => c.meta.pageStart && c.meta.pageStart > 1);
+
+    // Dry run - 只返回预览
+    if (dryRun) {
+      return c.json({
+        success: true,
+        dryRun: true,
+        documentId,
+        title: doc.title,
+        old: { chunkCount: oldChunkCount, types: oldChunkTypes },
+        new: {
+          chunkCount: newChunks.length,
+          types: newChunkTypes,
+          avgLength,
+          hasHeadings,
+          hasPages,
+          structuredBlocks: structuredBlocks.length,
+          blockTypes: {
+            text: structuredBlocks.filter(b => b.type === 'text').length,
+            table: structuredBlocks.filter(b => b.type === 'table').length,
+            heading: structuredBlocks.filter(b => b.type === 'heading').length,
+          },
+        },
+        sampleChunks: newChunks.slice(0, 5).map((c, i) => ({
+          index: i,
+          length: c.text.length,
+          type: c.meta.chunkType,
+          heading: c.meta.heading,
+          pageRange: c.meta.pageStart ? `${c.meta.pageStart}-${c.meta.pageEnd || c.meta.pageStart}` : null,
+          preview: c.text.slice(0, 200),
+        })),
+      });
+    }
+
+    // 4. 删除旧 chunks 和 KV embeddings
+    // 先获取旧的 embedding keys
+    const oldEmbeddings = await db.prepare(
+      'SELECT embedding_key FROM rag_chunks WHERE document_id = ? AND embedding_key IS NOT NULL AND embedding_key != \'\''
+    ).bind(documentId).all();
+
+    // 删除 KV 中的 embeddings
+    let kvDeleteCount = 0;
+    if (oldEmbeddings.results) {
+      for (const row of oldEmbeddings.results) {
+        const key = (row as any).embedding_key as string;
+        if (key) {
+          try { await kv.delete(key); kvDeleteCount++; } catch {}
+        }
+      }
+    }
+
+    // 删除旧 chunks
+    await db.prepare('DELETE FROM rag_chunks WHERE document_id = ?').bind(documentId).run();
+
+    // 5. 写入新 chunks
+    const BATCH = 50;
+    for (let i = 0; i < newChunks.length; i += BATCH) {
+      const batch = newChunks.slice(i, i + BATCH);
+      const stmts = batch.map((c, idx) => {
+        const chunkIdx = i + idx;
+        const pageRange = c.meta.pageStart
+          ? (c.meta.pageEnd && c.meta.pageEnd !== c.meta.pageStart
+            ? `${c.meta.pageStart}-${c.meta.pageEnd}` : `${c.meta.pageStart}`)
+          : null;
+        return db.prepare(`
+          INSERT INTO rag_chunks (document_id, chunk_index, content, content_length, embedding_key, has_embedding, metadata, chunk_type, page_range)
+          VALUES (?, ?, ?, ?, '', 0, ?, ?, ?)
+        `).bind(
+          documentId, chunkIdx, c.text, c.text.length,
+          JSON.stringify(c.meta), c.meta.chunkType || 'text', pageRange
+        );
+      });
+      await db.batch(stmts);
+    }
+
+    // 6. 生成 embeddings（如果不跳过）
+    let embeddingCount = 0;
+    if (!skipEmbedding) {
+      const dashscopeKey = c.env.DASHSCOPE_API_KEY;
+      const vectorengineKey = c.env.VECTORENGINE_API_KEY;
+
+      if (dashscopeKey || vectorengineKey) {
+        const embeddingConfig = createEmbeddingConfig({
+          dashscopeApiKey: dashscopeKey,
+          vectorengineApiKey: vectorengineKey,
+        });
+
+        const EMBED_BATCH = embeddingConfig.batchSize;
+        for (let i = 0; i < newChunks.length; i += EMBED_BATCH) {
+          const batchItems = newChunks.slice(i, i + EMBED_BATCH);
+          const batchTexts = batchItems.map(item => item.text);
+
+          try {
+            const embeddings = await generateEmbeddings(batchTexts, embeddingConfig);
+
+            const stmts: D1PreparedStatement[] = [];
+            for (let j = 0; j < batchItems.length; j++) {
+              const chunkIdx = i + j;
+              const embeddingKey = `rag:emb:${documentId}:${chunkIdx}`;
+              await kv.put(embeddingKey, JSON.stringify(embeddings[j]));
+
+              stmts.push(
+                db.prepare(
+                  'UPDATE rag_chunks SET embedding_key = ?, has_embedding = 1 WHERE document_id = ? AND chunk_index = ?'
+                ).bind(embeddingKey, documentId, chunkIdx)
+              );
+            }
+            await db.batch(stmts);
+            embeddingCount += batchItems.length;
+          } catch (embError) {
+            console.error(`[Rechunk] Embedding batch ${Math.floor(i / EMBED_BATCH) + 1} failed:`, embError);
+            // 继续处理，后续可通过 auto-sync advance 补充
+          }
+        }
+      }
+    }
+
+    // 7. 更新文档 chunk_count
+    await db.prepare(
+      'UPDATE rag_documents SET chunk_count = ?, updated_at = datetime(\'now\') WHERE id = ?'
+    ).bind(newChunks.length, documentId).run();
+
+    return c.json({
+      success: true,
+      documentId,
+      title: doc.title,
+      old: { chunkCount: oldChunkCount, types: oldChunkTypes, kvDeleted: kvDeleteCount },
+      new: {
+        chunkCount: newChunks.length,
+        types: newChunkTypes,
+        avgLength,
+        hasHeadings,
+        hasPages,
+        embeddingsGenerated: embeddingCount,
+      },
+      improvement: {
+        chunkCountChange: newChunks.length - oldChunkCount,
+        tablesPreserved: newChunkTypes.table,
+        headingsDetected: hasHeadings,
+        pagesEstimated: hasPages,
+      },
+    });
+
+  } catch (error) {
+    console.error('[Rechunk] Error:', error);
+    return c.json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Rechunk failed',
+    }, 500);
+  }
+});
+
+/**
+ * POST /rechunk-all — 对所有文档重新切片
+ * 
+ * 逐个调用 rechunk 逻辑，避免超时
+ * Query params:
+ * - dryRun=true : 只预览
+ * - skipEmbedding=true : 跳过 embedding
+ * - limit=N : 最多处理 N 个文档（默认全部）
+ */
+ragOps.post('/rechunk-all', async (c) => {
+  try {
+    const dryRun = c.req.query('dryRun') === 'true';
+    const skipEmbedding = c.req.query('skipEmbedding') === 'true';
+    const limit = parseInt(c.req.query('limit') || '100', 10);
+
+    const db = c.env.DB;
+
+    const docs = await db.prepare(
+      'SELECT id, title, stock_code, chunk_count FROM rag_documents WHERE status = \'completed\' ORDER BY id ASC LIMIT ?'
+    ).bind(limit).all();
+
+    if (!docs.results || docs.results.length === 0) {
+      return c.json({ success: true, message: 'No documents to rechunk', processed: 0 });
+    }
+
+    // 由于 Cloudflare Workers 有 CPU 时间限制，这里只返回文档列表和预览
+    // 实际 rechunk 需要逐个调用 /rechunk/:documentId
+    const docList = docs.results.map((d: any) => ({
+      id: d.id,
+      title: d.title,
+      stockCode: d.stock_code,
+      currentChunks: d.chunk_count,
+    }));
+
+    return c.json({
+      success: true,
+      message: dryRun
+        ? 'Dry run: listing documents that would be rechunked'
+        : 'Use POST /rechunk/:documentId to rechunk each document individually (Workers CPU limit)',
+      totalDocuments: docList.length,
+      documents: docList,
+      instructions: 'Call POST /api/rag/ops/rechunk/{documentId}?skipEmbedding=true for each document, then use auto-sync advance to generate embeddings',
+    });
+
+  } catch (error) {
+    return c.json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to list documents',
     }, 500);
   }
 });

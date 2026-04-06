@@ -969,44 +969,18 @@ export function createAutoSyncService(
             };
           }
 
-          // 分块（使用结构感知）
+          // 分块（使用结构化分块 V2 — 句子边界、表格保留、碎片合并、parent-child）
           const { extractStructuredBlocks } = await import('./ragPdfParser');
-          const { splitTextIntoChunks } = await import('./rag');
+          const { buildStructuredChunksV2 } = await import('./rag');
           const structuredBlocks = extractStructuredBlocks(cleanedMarkdown);
 
-          const chunks: Array<{ text: string; meta: Record<string, any> }> = [];
-          for (const block of structuredBlocks) {
-            if (block.type === 'heading') continue;
-            const blockContent = block.content.trim();
-            if (!blockContent) continue;
-
-            if (block.type === 'table') {
-              chunks.push({
-                text: blockContent,
-                meta: {
-                  chunkType: 'table',
-                  heading: block.heading,
-                  pageStart: block.pageStart,
-                  pageEnd: block.pageEnd,
-                  tableCaption: block.tableCaption,
-                  tableIndex: block.tableIndex,
-                },
-              });
-            } else {
-              const subChunks = splitTextIntoChunks(blockContent, { chunkSize: 500, chunkOverlap: 100 });
-              for (const sc of subChunks) {
-                chunks.push({
-                  text: sc,
-                  meta: {
-                    chunkType: 'text',
-                    heading: block.heading,
-                    pageStart: block.pageStart,
-                    pageEnd: block.pageEnd,
-                  },
-                });
-              }
-            }
-          }
+          const chunks = buildStructuredChunksV2(structuredBlocks, {
+            chunkSize: 800,
+            chunkOverlap: 50,
+            fileName: `${stockCode}_${reportYear}_${reportType}.pdf`,
+            stockCode,
+            category: reportType === 'annual' ? 'annual_report' : 'quarterly_report',
+          });
 
           console.log(`[AutoSync:advance] Task #${taskId}: storing ${chunks.length} chunks (no embeddings)`);
 
