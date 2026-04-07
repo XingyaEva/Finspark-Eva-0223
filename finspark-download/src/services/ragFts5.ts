@@ -138,40 +138,90 @@ export class FTS5Service {
   /**
    * 构建 FTS5 MATCH 查询表达式
    *
-   * 策略：
-   * 1. 清洗特殊字符（FTS5 语法保留字符）
-   * 2. 识别金融复合词 → 用引号包裹做短语匹配
-   * 3. 剩余词用空格连接（FTS5 默认隐式 AND）
+   * 策略（修订 v2 — unicode61 tokenizer 对中文按字符切分）：
+   * 1. 清洗特殊字符
+   * 2. 提取金融复合词 → 用引号包裹做短语匹配
+   * 3. 提取中文 2-4 字 n-gram 做短语匹配
+   * 4. 提取英文单词
+   * 5. 所有项用 OR 连接（unicode61 下 AND 过于严格，几乎无结果）
    * 
    * 示例：
-   *   "贵州茅台2024年净利润" → '"贵州茅台" "净利润" 2024年'
-   *   "营业收入同比增长" → '"营业收入" "同比增长"'
+   *   "比亚迪2024年营业收入" → '"比亚迪" OR "营业收入" OR "2024"'
+   *   "招商银行App月活跃用户" → '"招商银行" OR "月活跃" OR "活跃用" OR "跃用户" OR "app"'
    */
   private buildFTS5Query(query: string): string {
     if (!query || query.trim().length === 0) return '';
 
-    // 清洗 FTS5 特殊字符（保留中文、字母、数字、空格、引号）
+    // 清洗 FTS5 特殊字符（保留中文、字母、数字、空格）
     let cleaned = query
-      .replace(/[""'']/g, '"')      // 统一引号
-      .replace(/[(){}[\]^~*:]/g, ' ') // 移除 FTS5 特殊运算符
+      .replace(/[""'']/g, ' ')
+      .replace(/[(){}[\]^~*:+\-&|!@#$%]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
 
     if (!cleaned) return '';
 
-    // 识别并替换金融复合词为短语匹配
-    for (const phrase of FINANCIAL_PHRASES) {
-      if (cleaned.includes(phrase)) {
-        // 替换为 FTS5 短语查询 "..."
-        cleaned = cleaned.replace(phrase, `"${phrase}"`);
+    const terms: string[] = [];
+    const usedRanges: [number, number][] = []; // track what's been consumed
+
+    // Step 1: Extract known financial phrases (longest first)
+    const sortedPhrases = [...FINANCIAL_PHRASES].sort((a, b) => b.length - a.length);
+    for (const phrase of sortedPhrases) {
+      let idx = cleaned.indexOf(phrase);
+      while (idx >= 0) {
+        // Check not already consumed
+        const overlap = usedRanges.some(([s, e]) => idx < e && idx + phrase.length > s);
+        if (!overlap) {
+          terms.push(`"${phrase}"`);
+          usedRanges.push([idx, idx + phrase.length]);
+        }
+        idx = cleaned.indexOf(phrase, idx + 1);
       }
     }
 
-    // 确保结果不为空
-    const result = cleaned.trim();
-    if (!result) return '';
+    // Step 2: Extract Chinese character runs and make 2-4 char n-grams
+    const chineseRuns = cleaned.match(/[\u4e00-\u9fff\u3400-\u4dbf]{2,}/g) || [];
+    for (const run of chineseRuns) {
+      // Generate 2-3 char n-grams for each Chinese run
+      for (let n = Math.min(4, run.length); n >= 2; n--) {
+        for (let i = 0; i <= run.length - n; i++) {
+          const ngram = run.substring(i, i + n);
+          const phraseStr = `"${ngram}"`;
+          if (!terms.includes(phraseStr)) {
+            // Check not a substring of an already-added phrase
+            const isSubOfExisting = terms.some(t => t.length > phraseStr.length && t.includes(ngram));
+            if (!isSubOfExisting) {
+              terms.push(phraseStr);
+            }
+          }
+        }
+      }
+    }
 
-    return result;
+    // Step 3: Extract English words and numbers
+    const engWords = cleaned.match(/[a-zA-Z]+/gi) || [];
+    for (const w of engWords) {
+      if (w.length >= 2) {
+        const lw = w.toLowerCase();
+        if (!terms.some(t => t.toLowerCase().includes(lw))) {
+          terms.push(lw);
+        }
+      }
+    }
+    const numbers = cleaned.match(/\d{4}/g) || [];
+    for (const num of numbers) {
+      if (!terms.includes(num)) {
+        terms.push(num);
+      }
+    }
+
+    // Deduplicate and limit to top 15 terms (avoid overly complex queries)
+    const uniqueTerms = [...new Set(terms)].slice(0, 15);
+
+    if (uniqueTerms.length === 0) return '';
+
+    // Join with OR (implicit AND is too strict for unicode61 Chinese tokenization)
+    return uniqueTerms.join(' OR ');
   }
 
   // ==================== 索引管理 ====================
