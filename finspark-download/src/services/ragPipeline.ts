@@ -50,7 +50,8 @@ export interface MergedChunk {
   documentId: number;
   documentTitle: string;
   content: string;
-  score: number;
+  score: number;                // 当前分数（可能已被 rerank 调整）
+  originalScore: number;        // 原始检索分数（rerank 前），用于评估 Relevance
   pageRange?: string;
   heading?: string;
   chunkType?: string;
@@ -379,7 +380,9 @@ export class PipelineService {
           documentTitle: c.documentTitle || `文档${c.documentId}`,
           chunkContent:
             cleanContent.slice(0, 200) + (cleanContent.length > 200 ? '...' : ''),
-          relevanceScore: Math.round(c.score * 1000) / 1000,
+          // 使用原始检索分数（rerank 前）作为 relevanceScore —— 
+          // rerank 后分数集中在 0.3-0.6，会让 Relevance 评分（阈值 0.6）误判为不相关
+          relevanceScore: Math.round((c.originalScore || c.score) * 1000) / 1000,
           chunkId: c.chunkId,
           pageRange: c.pageRange,
           heading: c.heading,
@@ -536,6 +539,7 @@ export class PipelineService {
           documentTitle: vr.documentTitle || '',
           content: vr.chunk.content,
           score: vr.score,
+          originalScore: vr.score,  // 保存原始检索分数（rerank 前）
           pageRange: meta.pageStart ? `${meta.pageStart}${meta.pageEnd && meta.pageEnd !== meta.pageStart ? '-' + meta.pageEnd : ''}` : meta.pageRange,
           heading: meta.heading,
           chunkType: meta.chunkType,
@@ -565,6 +569,7 @@ export class PipelineService {
           documentTitle: '', // BM25 结果没有 title，后续可以补充
           content: br.content,
           score: bm25Normalized,
+          originalScore: bm25Normalized,  // BM25-only 原始分数
           source: 'bm25',
         });
       }
