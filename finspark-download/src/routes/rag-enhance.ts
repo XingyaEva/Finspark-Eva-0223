@@ -440,7 +440,8 @@ ragEnhance.post('/evaluations/:id/run', async (c) => {
           chunkId: s.chunkId || 0,
           pageRange: s.pageRange,
           relevanceScore: s.relevanceScore,
-          chunkContent: s.chunkContent || '',
+          // 评测打分使用完整 chunk 内容（_fullContent），确保 faithfulness/sufficiency 评估准确
+          chunkContent: s._fullContent || s.chunkContent || '',
           documentTitle: s.documentTitle || '',
         })),
         latencyMs: result.pipeline.totalLatencyMs,

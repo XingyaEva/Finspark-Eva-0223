@@ -68,6 +68,7 @@ export interface EnhancedSource {
   chunkType?: string;
   sourceFile?: string;
   source: 'vector' | 'bm25' | 'both';
+  _fullContent?: string; // 完整 chunk 内容（仅内部评测使用，不序列化到 API 响应）
 }
 
 export interface PipelineMetrics {
@@ -335,6 +336,7 @@ export class PipelineService {
       llmOutputTokens = llmResponse.outputTokens;
 
       // 构造来源列表
+      // chunkContent: API 响应用 200 字截断；内部 _fullContent 用于评测打分（不序列化到外部 JSON）
       const sources: EnhancedSource[] = finalChunks.map((c) => ({
         documentId: c.documentId,
         documentTitle: c.documentTitle || `文档${c.documentId}`,
@@ -347,6 +349,7 @@ export class PipelineService {
         chunkType: c.chunkType,
         sourceFile: c.sourceFile,
         source: c.source,
+        _fullContent: c.content, // 完整内容，用于评测 faithfulness/sufficiency 打分
       }));
 
       // ⑥ 保存对话记录到 rag_conversations
