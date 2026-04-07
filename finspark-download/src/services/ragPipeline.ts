@@ -15,6 +15,7 @@ import type { FTS5Service, FTS5SearchResult } from './ragFts5';
 import type { IntentService, IntentResult } from './ragIntent';
 import type { AutoSyncService } from './ragAutoSync';
 import type { GpuProvider } from './ragGpuProvider';
+import { cleanLatexNoise } from './ragPdfParser';
 
 // ==================== 类型定义 ====================
 
@@ -337,20 +338,24 @@ export class PipelineService {
 
       // 构造来源列表
       // chunkContent: API 响应用 200 字截断；内部 _fullContent 用于评测打分（不序列化到外部 JSON）
-      const sources: EnhancedSource[] = finalChunks.map((c) => ({
-        documentId: c.documentId,
-        documentTitle: c.documentTitle || `文档${c.documentId}`,
-        chunkContent:
-          c.content.slice(0, 200) + (c.content.length > 200 ? '...' : ''),
-        relevanceScore: Math.round(c.score * 1000) / 1000,
-        chunkId: c.chunkId,
-        pageRange: c.pageRange,
-        heading: c.heading,
-        chunkType: c.chunkType,
-        sourceFile: c.sourceFile,
-        source: c.source,
-        _fullContent: c.content, // 完整内容，用于评测 faithfulness/sufficiency 打分
-      }));
+      // 清洗 LaTeX 噪音：已存储的旧 chunk 可能含有 MinerU 残留公式
+      const sources: EnhancedSource[] = finalChunks.map((c) => {
+        const cleanContent = cleanLatexNoise(c.content);
+        return {
+          documentId: c.documentId,
+          documentTitle: c.documentTitle || `文档${c.documentId}`,
+          chunkContent:
+            cleanContent.slice(0, 200) + (cleanContent.length > 200 ? '...' : ''),
+          relevanceScore: Math.round(c.score * 1000) / 1000,
+          chunkId: c.chunkId,
+          pageRange: c.pageRange,
+          heading: c.heading,
+          chunkType: c.chunkType,
+          sourceFile: c.sourceFile,
+          source: c.source,
+          _fullContent: cleanContent, // 完整内容（已清洗），用于评测 faithfulness/sufficiency 打分
+        };
+      });
 
       // ⑥ 保存对话记录到 rag_conversations
       try {
@@ -792,7 +797,9 @@ export class PipelineService {
         const pageInfo = chunk.pageRange ? `, 第${chunk.pageRange}页` : '';
         const headingInfo = chunk.heading ? `, ${chunk.heading}` : '';
         const typeLabel = chunk.chunkType === 'table' ? ' [表格]' : '';
-        context += `【来源${index + 1}: ${chunk.documentTitle || '未命名文档'}${pageInfo}${headingInfo}${typeLabel} (${sourceLabel}, 相关度: ${Math.round(chunk.score * 100)}%)】\n${chunk.content}\n\n`;
+        // 清洗 LaTeX 噪音（已存储的旧 chunk 可能含有 $5,0\\%$ 等 MinerU 残留）
+        const cleanContent = cleanLatexNoise(chunk.content);
+        context += `【来源${index + 1}: ${chunk.documentTitle || '未命名文档'}${pageInfo}${headingInfo}${typeLabel} (${sourceLabel}, 相关度: ${Math.round(chunk.score * 100)}%)】\n${cleanContent}\n\n`;
       });
     }
 

@@ -1063,25 +1063,35 @@ ${context}
 
     if (chunks.length === 0) return 30;
 
-    const chunksText = chunks.map((c, i) =>
-      `【片段${i + 1}】(${c.chunkContent!.length}字)\n${c.chunkContent!.slice(0, 500)}`
-    ).join('\n\n');
+    // 传完整内容给 LLM（上限 800 字/片段，3 片段共 ~2400 字在 gpt-4.1-mini 上下文窗口内）
+    // 之前截断到 500 字会导致 LLM 误判"片段被截断"，拉低 integrity 分 ~15%
+    const MAX_CHUNK_DISPLAY = 800;
+    const chunksText = chunks.map((c, i) => {
+      const content = c.chunkContent!;
+      const display = content.length <= MAX_CHUNK_DISPLAY
+        ? content
+        : content.slice(0, MAX_CHUNK_DISPLAY) + `...(全文${content.length}字)`;
+      return `【片段${i + 1}】(${content.length}字)\n${display}`;
+    }).join('\n\n');
 
     const prompt = `你是文档切片质量审核员。请判断以下文档片段的切分是否合理。
 
 ${chunksText}
 
 对每个片段评估：
-1. 是否在句子中间被截断？
-2. 是否在段落/语义单元中间被切断？
-3. 片段是否自包含，能独立理解？
-4. 如果是表格数据，表头是否完整？
+1. 片段是否在句子中间被截断（如句子只有上半句）？
+2. 片段是否在段落/语义单元中间被切断（如一个概念的描述被拆成两半）？
+3. 片段是否自包含，能独立理解其主题？
+4. 如果是表格数据，表头和数据行是否完整？
+5. 片段中是否有 LaTeX 残留噪音（如 $5,0\\%$ 之类的格式问题）？
+
+注意：片段以"..."结尾是因为显示截断，不代表原文被截断。请根据内容本身的完整性判断。
 
 请严格按照以下 JSON 格式返回：
 {"scores": [<片段1分数>, <片段2分数>, ...], "issues": "<发现的切分问题>"}
 
-每个片段评分标准：
-- 90-100: 片段完整，在自然段落/章节边界切分
+评分标准：
+- 90-100: 片段完整，在自然段落/章节边界切分，语义自包含
 - 70-89: 基本完整，偶有句尾截断但不影响理解
 - 50-69: 有明显截断，部分信息不完整
 - 30-49: 严重截断，在句子或表格中间断开
@@ -1100,7 +1110,7 @@ ${chunksText}
           { role: 'user', content: prompt },
         ],
         temperature: 0.2,
-        max_tokens: 200,
+        max_tokens: 300,
       }),
     });
 

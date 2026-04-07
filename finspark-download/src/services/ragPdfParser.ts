@@ -691,8 +691,60 @@ function extractMarkdownFromZip(zipBytes: Uint8Array): string | null {
 /**
  * 清理 MinerU 返回的 Markdown，使其更适合 RAG 分块
  */
+/**
+ * 清洗 MinerU 输出的 LaTeX/公式噪音
+ * 
+ * MinerU PDF 解析器会将 PDF 中的数字百分比转为 LaTeX 格式，如：
+ *   $5 , 0 \%$ → 5.0%
+ *   $2 9 . 0 2 \%$ → 29.02%
+ *   $4 6 , 0 6 \%$ → 46.06%
+ * 
+ * 这些噪音严重影响：
+ * - embedding 质量（向量化时 "$5 , 0 \\%$" 与 "5.0%" 语义距离很大）
+ * - BM25 检索（FTS5 无法匹配被空格打散的数字）
+ * - LLM 理解（模型可能误读被拆分的数字）
+ */
+export function cleanLatexNoise(text: string): string {
+  let cleaned = text;
+
+  // 1. 处理 $数字 , 数字 \%$ 或 $数字 . 数字 \%$ 模式
+  //    例: $5 , 0 \%$ → 5.0%    $2 9 . 0 2 \%$ → 29.02%    $4 6 , 0 6 \%$ → 46.06%
+  cleaned = cleaned.replace(/\$\s*([\d\s,.\\/]+?)\\?%\s*\$/g, (_match: string, numPart: string) => {
+    // 移除数字间的空格，将逗号转为小数点（欧洲数字格式）
+    const num = numPart.replace(/\s+/g, '').replace(/\\$/g, '');
+    // 如果只有一个逗号且在合理小数点位置，转为小数点
+    const normalized = num.replace(/,(?=\d{1,2}$)/, '.');
+    return `${normalized}%`;
+  });
+
+  // 2. 处理 $纯数字$ 模式（无百分号）
+  //    例: $1 , 2 8 6 . 6$ → 1,286.6
+  cleaned = cleaned.replace(/\$\s*([\d\s,.]+?)\s*\$/g, (_match: string, numPart: string) => {
+    const num = numPart.replace(/\s+/g, '');
+    // 如果看起来像正常数字，直接返回
+    if (/^[\d,.]+$/.test(num)) {
+      return num;
+    }
+    return _match; // 不确定的模式保留原样
+  });
+
+  // 3. 处理残留的 LaTeX 转义
+  //    \\% → %,  \% → %
+  cleaned = cleaned.replace(/\\\\%/g, '%');
+  cleaned = cleaned.replace(/\\%/g, '%');
+
+  // 4. 处理 MinerU 的 LaTeX 数学模式残留
+  //    \$ ... \$ (escaped dollar signs from JSON)
+  cleaned = cleaned.replace(/\\\$/g, '$');
+
+  return cleaned;
+}
+
 export function cleanMineruMarkdown(markdown: string): string {
   let cleaned = markdown;
+
+  // 0. 清洗 LaTeX/公式噪音（最先执行，在结构化提取之前）
+  cleaned = cleanLatexNoise(cleaned);
 
   // 1. 移除多余的空行（保留最多2个连续空行）
   cleaned = cleaned.replace(/\n{4,}/g, '\n\n\n');

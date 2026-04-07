@@ -480,40 +480,71 @@ export function buildStructuredChunksV2(
     }
   }
 
-  // P1: 碎片合并 — 将 <100 字的短 chunk 合并到前一个 chunk
-  const MIN_CHUNK_SIZE = 100;
+  // P1: 碎片合并 — 增强版
+  // 策略改进：
+  // (a) 阈值从 100 提升到 150 字，减少碎片 chunk
+  // (b) 允许跨类型合并：text 碎片可以合并到相邻的 table/text chunk（反之亦然）
+  // (c) 碎片优先向前合并，如果前一个 chunk 已满则向后合并
+  const MIN_CHUNK_SIZE = 150;
+  const MAX_MERGE_SIZE = effectiveChunkSize * 1.8;
   const merged: Array<{ text: string; meta: ChunkMetadata }> = [];
-  for (const item of result) {
+  for (let k = 0; k < result.length; k++) {
+    const item = result[k];
     if (item.text.length < MIN_CHUNK_SIZE && merged.length > 0) {
       const prev = merged[merged.length - 1];
-      if (prev.meta.chunkType === 'text' && item.meta.chunkType === 'text'
-          && (prev.text.length + item.text.length) < effectiveChunkSize * 1.5) {
+      // 向前合并：只要合并后不超过上限（跨类型也允许，因为碎片通常是标题/表格说明）
+      if ((prev.text.length + item.text.length) < MAX_MERGE_SIZE) {
         prev.text += '\n' + item.text;
         if (item.meta.pageEnd && item.meta.pageEnd > (prev.meta.pageEnd || 0)) {
           prev.meta.pageEnd = item.meta.pageEnd;
         }
+        // 如果碎片有 heading 信息，更新 parent 的 heading
+        if (item.meta.heading && !prev.meta.heading) {
+          prev.meta.heading = item.meta.heading;
+        }
         continue;
       }
+      // 如果前一个 chunk 太大无法合并，尝试向后合并到下一个非碎片 chunk
+      // 这里先添加，后面再处理（two-pass）
     }
     merged.push(item);
   }
 
+  // P1.5: 第二轮 — 处理仍然是碎片的 chunk（尝试向后合并）
+  const final: Array<{ text: string; meta: ChunkMetadata }> = [];
+  for (let k = 0; k < merged.length; k++) {
+    const item = merged[k];
+    if (item.text.length < MIN_CHUNK_SIZE && k + 1 < merged.length) {
+      const next = merged[k + 1];
+      if ((next.text.length + item.text.length) < MAX_MERGE_SIZE) {
+        next.text = item.text + '\n' + next.text;
+        if (item.meta.pageStart && (!next.meta.pageStart || item.meta.pageStart < next.meta.pageStart)) {
+          next.meta.pageStart = item.meta.pageStart;
+        }
+        continue; // skip this fragment, it's merged into next
+      }
+    }
+    final.push(item);
+  }
+
   // P2: 为每个 child chunk 标记 parent_section_id
   let sectionStartIdx = 0;
-  for (let j = 0; j < merged.length; j++) {
-    const meta = merged[j].meta;
+  for (let j = 0; j < final.length; j++) {
+    const meta = final[j].meta;
     if (meta.headingLevel && meta.headingLevel <= 2 && meta.chunkType !== 'text') {
       sectionStartIdx = j;
     }
     meta.parentSectionIdx = sectionStartIdx;
   }
 
-  console.log(`[StructuredChunksV2:standalone] ${result.length} raw -> ${merged.length} merged ` +
-    `(tables: ${merged.filter(c => c.meta.chunkType === 'table').length}, ` +
-    `text: ${merged.filter(c => c.meta.chunkType === 'text').length}, ` +
-    `avg len: ${Math.round(merged.reduce((s, c) => s + c.text.length, 0) / (merged.length || 1))})`);
+  const fragmentCount = final.filter(c => c.text.length < MIN_CHUNK_SIZE).length;
+  console.log(`[StructuredChunksV2:standalone] ${result.length} raw -> ${final.length} merged ` +
+    `(tables: ${final.filter(c => c.meta.chunkType === 'table').length}, ` +
+    `text: ${final.filter(c => c.meta.chunkType === 'text').length}, ` +
+    `fragments<${MIN_CHUNK_SIZE}: ${fragmentCount}, ` +
+    `avg len: ${Math.round(final.reduce((s, c) => s + c.text.length, 0) / (final.length || 1))})`);
 
-  return merged;
+  return final;
 }
 
 /**
@@ -1005,19 +1036,22 @@ export class RAGService {
       }
     }
 
-    // P1: 碎片合并 — 将 <100 字的短 chunk 合并到前一个 chunk
-    const MIN_CHUNK_SIZE = 100;
+    // P1: 碎片合并 — 增强版（与 standalone 版保持一致）
+    // (a) 阈值 150 字，(b) 跨类型合并，(c) 双向合并
+    const MIN_CHUNK_SIZE = 150;
+    const MAX_MERGE_SIZE = effectiveChunkSize * 1.8;
     const merged: Array<{ text: string; meta: ChunkMetadata }> = [];
-    for (const item of result) {
+    for (let k = 0; k < result.length; k++) {
+      const item = result[k];
       if (item.text.length < MIN_CHUNK_SIZE && merged.length > 0) {
         const prev = merged[merged.length - 1];
-        // 只合并同类型（都是 text）且合并后不超过上限的
-        if (prev.meta.chunkType === 'text' && item.meta.chunkType === 'text'
-            && (prev.text.length + item.text.length) < effectiveChunkSize * 1.5) {
+        if ((prev.text.length + item.text.length) < MAX_MERGE_SIZE) {
           prev.text += '\n' + item.text;
-          // 更新 pageEnd
           if (item.meta.pageEnd && item.meta.pageEnd > (prev.meta.pageEnd || 0)) {
             prev.meta.pageEnd = item.meta.pageEnd;
+          }
+          if (item.meta.heading && !prev.meta.heading) {
+            prev.meta.heading = item.meta.heading;
           }
           continue;
         }
@@ -1025,22 +1059,41 @@ export class RAGService {
       merged.push(item);
     }
 
+    // P1.5: 第二轮 — 仍然是碎片的向后合并
+    const final: Array<{ text: string; meta: ChunkMetadata }> = [];
+    for (let k = 0; k < merged.length; k++) {
+      const item = merged[k];
+      if (item.text.length < MIN_CHUNK_SIZE && k + 1 < merged.length) {
+        const next = merged[k + 1];
+        if ((next.text.length + item.text.length) < MAX_MERGE_SIZE) {
+          next.text = item.text + '\n' + next.text;
+          if (item.meta.pageStart && (!next.meta.pageStart || item.meta.pageStart < next.meta.pageStart)) {
+            next.meta.pageStart = item.meta.pageStart;
+          }
+          continue;
+        }
+      }
+      final.push(item);
+    }
+
     // P2: 为每个 child chunk 标记 parent_section_id（章节内的第一个 chunk 索引）
     let sectionStartIdx = 0;
-    for (let j = 0; j < merged.length; j++) {
-      const meta = merged[j].meta;
+    for (let j = 0; j < final.length; j++) {
+      const meta = final[j].meta;
       if (meta.headingLevel && meta.headingLevel <= 2 && meta.chunkType !== 'text') {
         sectionStartIdx = j;
       }
       meta.parentSectionIdx = sectionStartIdx;
     }
 
-    console.log(`[StructuredChunks v2] ${result.length} raw → ${merged.length} merged ` +
-      `(tables: ${merged.filter(c => c.meta.chunkType === 'table').length}, ` +
-      `text: ${merged.filter(c => c.meta.chunkType === 'text').length}, ` +
-      `avg len: ${Math.round(merged.reduce((s, c) => s + c.text.length, 0) / merged.length)})`);
+    const fragmentCount = final.filter(c => c.text.length < MIN_CHUNK_SIZE).length;
+    console.log(`[StructuredChunks v2] ${result.length} raw → ${final.length} merged ` +
+      `(tables: ${final.filter(c => c.meta.chunkType === 'table').length}, ` +
+      `text: ${final.filter(c => c.meta.chunkType === 'text').length}, ` +
+      `fragments<${MIN_CHUNK_SIZE}: ${fragmentCount}, ` +
+      `avg len: ${Math.round(final.reduce((s, c) => s + c.text.length, 0) / (final.length || 1))})`);
 
-    return merged;
+    return final;
   }
 
   /**
