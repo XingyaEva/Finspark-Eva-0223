@@ -39,7 +39,7 @@ export const DEFAULT_ENHANCED_CONFIG: EnhancedRAGConfig = {
   minScore: 0.20,               // v5: lowered from 0.25 to capture more candidates
   rerankWeight: 0.7,
   contextMode: 'adjacent',      // v5: enable adjacent context expansion by default
-  contextWindow: 1,             // adjacent 模式默认前后各 1 个 chunk
+  contextWindow: 2,             // adjacent 模式默认前后各 2 个 chunk（更完整的上下文）
 };
 
 /** 合并后的 Chunk 内部类型（含 chunkIndex，用于 context expansion） */
@@ -805,17 +805,17 @@ export class PipelineService {
             ? '用户在进行对比分析，请分别列出各对象的数据后给出比较结论。'
             : '';
 
-    const systemPrompt = `你是Finspark AI财报知识库助手。你可以基于知识库中的公司财报文档回答用户问题。
+    const systemPrompt = `你是Finspark AI财报知识库助手。你严格基于知识库中的公司财报文档回答用户问题。
 
 ${context ? '【知识库检索结果】\n' + context : '当前知识库中没有找到与问题高度相关的文档。'}
 
 ${intentHint ? '【提示】' + intentHint + '\n' : ''}
 回答规则：
-1. 优先基于知识库中的文档内容来回答
-2. 如果知识库中有相关信息，请引用具体来源（包括文档名称、页码和章节）
-3. 如果知识库中没有足够信息，可以基于你的金融知识补充，但要说明哪些是文档中的信息，哪些是补充分析
-4. 使用专业但易懂的中文回答
-5. 如果涉及投资建议，需要声明"仅供参考，不构成投资建议"
+1. **严格基于**知识库中的文档内容回答，不得捏造、推测或补充文档中不存在的数据
+2. 引用具体来源（文档名称、页码、章节），确保每个关键数据点都能在检索结果中找到出处
+3. 如果检索结果中没有足够信息回答问题，明确说明"根据当前检索到的文档，未找到XXX相关数据"，不要编造数字
+4. 对于数值型问题，务必准确引用原文中的数字，不要四舍五入或换算（除非同时标注原始数值）
+5. 使用专业但易懂的中文回答
 6. 在回答末尾标注参考来源，格式如：📄 文档名称 · 第X页 · 章节名`;
 
     const messages = [
