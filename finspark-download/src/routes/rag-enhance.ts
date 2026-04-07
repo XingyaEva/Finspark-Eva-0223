@@ -472,6 +472,152 @@ ragEnhance.post('/evaluations/:id/run', async (c) => {
 });
 
 /**
+ * POST /evaluations/:id/finalize — 手动计算并保存最终评分
+ * 用于 Worker 超时导致 runEvaluation 未完成最终化的情况
+ * 从已有的 rag_evaluation_results 中读取所有打分，计算 7 维加权总分并更新数据库
+ */
+ragEnhance.post('/evaluations/:id/finalize', async (c) => {
+  try {
+    const svc = createTestSetServiceFromEnv(c.env);
+    const id = parseInt(c.req.param('id'));
+    if (isNaN(id)) return c.json({ success: false, error: 'Invalid evaluation ID' }, 400);
+
+    const evaluation = await svc.getEvaluation(id);
+    if (!evaluation) return c.json({ success: false, error: '评测不存在' }, 404);
+
+    // Read all results for this evaluation
+    const db = c.env.DB;
+    const results = await db.prepare(
+      `SELECT question_id, question_type, difficulty, score, is_correct, scoring_reason
+       FROM rag_evaluation_results WHERE evaluation_id = ?
+       ORDER BY question_id ASC`
+    ).bind(id).all();
+
+    const allResults = results.results || [];
+    if (allResults.length === 0) {
+      return c.json({ success: false, error: '没有评测结果' }, 400);
+    }
+
+    // Deduplicate by question_id (keep last = latest)
+    const byQid = new Map<number, any>();
+    for (const r of allResults) {
+      byQid.set(r.question_id as number, r);
+    }
+
+    const uniqueResults = [...byQid.values()];
+    const total = uniqueResults.length;
+
+    // Parse dimension scores from scoring_reason
+    let suffSum = 0, relSum = 0, intSum = 0, recSum = 0;
+    let semSum = 0, exSum = 0, faithSum = 0, citSum = 0;
+
+    const typeScores: Record<string, { total: number; sum: number }> = {};
+    const difficultyScores: Record<string, { total: number; sum: number }> = {};
+
+    for (const r of uniqueResults) {
+      const reason = (r.scoring_reason || '') as string;
+      const score = (r.score || 0) as number;
+      const qt = (r.question_type || 'unknown') as string;
+      const diff = (r.difficulty || 'unknown') as string;
+
+      // Parse: "充分: 10% | 相关: 76% | 完整: 43% | 召回: 56% | 语义: 40% | 精确: 25% | 忠实: 20% | 引用: 100%"
+      const parseVal = (key: string): number => {
+        const m = reason.match(new RegExp(key + '[：:]\\s*(\\d+)%'));
+        return m ? parseInt(m[1]) : 50;
+      };
+      suffSum += parseVal('充分');
+      relSum += parseVal('相关');
+      intSum += parseVal('完整');
+      recSum += parseVal('召回');
+      semSum += parseVal('语义');
+      exSum += parseVal('精确');
+      faithSum += parseVal('忠实');
+      citSum += parseVal('引用');
+
+      // Accumulate by type and difficulty
+      if (!typeScores[qt]) typeScores[qt] = { total: 0, sum: 0 };
+      typeScores[qt].total++;
+      typeScores[qt].sum += score;
+      if (!difficultyScores[diff]) difficultyScores[diff] = { total: 0, sum: 0 };
+      difficultyScores[diff].total++;
+      difficultyScores[diff].sum += score;
+    }
+
+    // 7-dimension weighted v3 formula
+    const suf = suffSum / total;
+    const rel = relSum / total;
+    const intg = intSum / total;
+    const rec = recSum / total;
+    const sem = semSum / total;
+    const ex = exSum / total;
+    const faith = faithSum / total;
+    const cit = citSum / total;
+
+    const overallScore = suf * 0.25 + rel * 0.10 + intg * 0.10 + rec * 0.10 + sem * 0.25 + ex * 0.10 + faith * 0.10;
+
+    const scoresByType: Record<string, number> = {};
+    for (const [k, v] of Object.entries(typeScores)) {
+      scoresByType[k] = Math.round((v.sum / v.total) * 10) / 10;
+    }
+    const scoresByDifficulty: Record<string, number> = {};
+    for (const [k, v] of Object.entries(difficultyScores)) {
+      scoresByDifficulty[k] = Math.round((v.sum / v.total) * 10) / 10;
+    }
+
+    // Update database
+    await db.prepare(
+      `UPDATE rag_evaluations SET
+       status = 'completed', completed_questions = ?, overall_score = ?,
+       exact_match_score = ?, semantic_score = ?, recall_score = ?, citation_score = ?,
+       faithfulness_score = ?,
+       context_sufficiency_score = ?, chunk_relevance_score = ?, chunk_integrity_score = ?,
+       scores_by_type = ?, scores_by_difficulty = ?, completed_at = datetime('now')
+       WHERE id = ?`
+    ).bind(
+      total, Math.round(overallScore * 10) / 10,
+      Math.round(ex * 10) / 10,
+      Math.round(sem * 10) / 10,
+      Math.round(rec * 10) / 10,
+      Math.round(cit * 10) / 10,
+      Math.round(faith * 10) / 10,
+      Math.round(suf * 10) / 10,
+      Math.round(rel * 10) / 10,
+      Math.round(intg * 10) / 10,
+      JSON.stringify(scoresByType),
+      JSON.stringify(scoresByDifficulty),
+      id
+    ).run();
+
+    // Update test set
+    await db.prepare(
+      "UPDATE rag_test_sets SET last_eval_score = ?, last_eval_at = datetime('now'), updated_at = datetime('now') WHERE id = ?"
+    ).bind(Math.round(overallScore * 10) / 10, evaluation.test_set_id).run();
+
+    return c.json({
+      success: true,
+      evaluationId: id,
+      uniqueQuestions: total,
+      overall: Math.round(overallScore * 10) / 10,
+      dimensions: {
+        contextSufficiency: Math.round(suf * 10) / 10,
+        chunkRelevance: Math.round(rel * 10) / 10,
+        chunkIntegrity: Math.round(intg * 10) / 10,
+        recall: Math.round(rec * 10) / 10,
+        semantic: Math.round(sem * 10) / 10,
+        exactMatch: Math.round(ex * 10) / 10,
+        faithfulness: Math.round(faith * 10) / 10,
+        citation: Math.round(cit * 10) / 10,
+      },
+      scoresByType,
+      scoresByDifficulty,
+    });
+  } catch (error) {
+    console.error('[RAG Enhance] Finalize evaluation error:', error);
+    return c.json({ success: false, error: '最终化评测失败: ' + (error as Error).message }, 500);
+  }
+});
+
+/**
  * GET /evaluations — 获取评测列表
  * Query: ?testSetId=&status=&limit=20&offset=0
  */

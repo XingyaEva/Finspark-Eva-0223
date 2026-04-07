@@ -498,22 +498,25 @@ export class PipelineService {
     }
 
     // 合并 BM25 检索结果
+    // 策略：向量搜索是主要排序信号，BM25 用于补充召回
+    // - 双通道命中的 chunk 获得额外 boost（+0.10），确保排在前面
+    // - BM25-only 的 chunk 分数 cap 在 0.45，不会挤掉向量结果
     for (const br of bm25Results) {
       const existing = mergedMap.get(br.chunkId);
       if (existing) {
-        // 同一 Chunk 在两种检索中都出现 — 显著提升分数（双通道命中更可信）
+        // 双通道命中 — 在原向量分数基础上加 boost
         existing.source = 'both';
-        const bm25Normalized = this.normalizeBM25Score(br.score);
-        // Reciprocal Rank Fusion style boost: combine both scores with a bonus
-        existing.score = Math.min(1.0, existing.score * 0.6 + bm25Normalized * 0.3 + 0.15);
+        existing.score = Math.min(1.0, existing.score + 0.10);
       } else {
+        // BM25-only — 使用 capped 分数（不超过 0.45，低于典型向量分数 0.5+）
+        const bm25Normalized = Math.min(0.45, this.normalizeBM25Score(br.score));
         mergedMap.set(br.chunkId, {
           chunkId: br.chunkId,
           chunkIndex: -1, // BM25 结果暂无 chunkIndex，expandAdjacentContext 时会通过 DB 补充
           documentId: br.documentId,
           documentTitle: '', // BM25 结果没有 title，后续可以补充
           content: br.content,
-          score: this.normalizeBM25Score(br.score),
+          score: bm25Normalized,
           source: 'bm25',
         });
       }
