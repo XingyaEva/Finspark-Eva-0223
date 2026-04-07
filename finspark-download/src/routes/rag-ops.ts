@@ -432,6 +432,43 @@ ragOps.post('/rebuild-fts5', async (c) => {
 });
 
 /**
+ * GET /fts5-debug — 调试 FTS5 查询
+ */
+ragOps.get('/fts5-debug', async (c) => {
+  try {
+    const query = c.req.query('q') || '比亚迪';
+    const db = c.env.DB;
+    
+    // 1. Count total rows
+    const totalRows = await db.prepare('SELECT COUNT(*) as cnt FROM rag_chunks_fts').first<{cnt:number}>();
+    
+    // 2. Try a simple MATCH
+    const matchResult = await db.prepare(
+      `SELECT f.rowid, bm25(rag_chunks_fts) as score FROM rag_chunks_fts f WHERE rag_chunks_fts MATCH ? LIMIT 3`
+    ).bind(query).all();
+    
+    // 3. Build the query the same way FTS5Service does
+    const fts5Service = createFTS5Service(db);
+    const fts5Results = await fts5Service.search(query, { topK: 3 });
+    
+    // 4. Sample content from first 3 chunks
+    const sample = await db.prepare('SELECT rowid, substr(content, 1, 100) as preview FROM rag_chunks_fts LIMIT 3').all();
+
+    return c.json({
+      success: true,
+      query,
+      totalFtsRows: totalRows?.cnt || 0,
+      directMatchCount: matchResult.results?.length || 0,
+      directMatchResults: matchResult.results?.map((r: any) => ({ rowid: r.rowid, score: r.score })) || [],
+      fts5ServiceResults: fts5Results.length,
+      sampleRows: sample.results || [],
+    });
+  } catch (error) {
+    return c.json({ success: false, error: String(error) }, 500);
+  }
+});
+
+/**
  * GET /fts5-stats — 获取 FTS5 索引统计
  */
 ragOps.get('/fts5-stats', async (c) => {
