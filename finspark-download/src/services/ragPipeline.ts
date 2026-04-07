@@ -811,7 +811,10 @@ export class PipelineService {
     });
 
     const reranked = await Promise.all(rerankPromises);
-    return reranked.sort((a, b) => b.score - a.score);
+    // 合并：rerank 过的 top-4 + 未 rerank 的其余 chunks（保留原始分数）
+    // 这样 topK=8 时可以返回 8 个 sources，而非仅 4 个
+    const remaining = chunks.slice(4);
+    return [...reranked, ...remaining].sort((a, b) => b.score - a.score);
   }
 
   // ==================== LLM 回答生成 ====================
