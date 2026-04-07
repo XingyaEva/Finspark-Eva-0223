@@ -35,10 +35,10 @@ export interface EnhancedRAGConfig {
 export const DEFAULT_ENHANCED_CONFIG: EnhancedRAGConfig = {
   enableBm25: true,
   enableRerank: false,          // 默认关闭 LLM 重排
-  topK: 5,
-  minScore: 0.25,
+  topK: 8,                      // v5: increased from 5 to 8 for better recall
+  minScore: 0.20,               // v5: lowered from 0.25 to capture more candidates
   rerankWeight: 0.7,
-  contextMode: 'none',          // 默认关闭上下文扩展（向后兼容）
+  contextMode: 'adjacent',      // v5: enable adjacent context expansion by default
   contextWindow: 1,             // adjacent 模式默认前后各 1 个 chunk
 };
 
@@ -501,9 +501,11 @@ export class PipelineService {
     for (const br of bm25Results) {
       const existing = mergedMap.get(br.chunkId);
       if (existing) {
-        // 同一 Chunk 在两种检索中都出现
+        // 同一 Chunk 在两种检索中都出现 — 显著提升分数（双通道命中更可信）
         existing.source = 'both';
-        existing.score = Math.max(existing.score, this.normalizeBM25Score(br.score));
+        const bm25Normalized = this.normalizeBM25Score(br.score);
+        // Reciprocal Rank Fusion style boost: combine both scores with a bonus
+        existing.score = Math.min(1.0, existing.score * 0.6 + bm25Normalized * 0.3 + 0.15);
       } else {
         mergedMap.set(br.chunkId, {
           chunkId: br.chunkId,
