@@ -195,16 +195,20 @@ export class TushareService {
   async getStockBasic(tsCode: string): Promise<StockBasic | null> {
     const cacheKey = CacheKeys.stockBasic(tsCode);
     
-    const data = await this.callApiWithCache<StockBasic[]>(
-      cacheKey,
-      CACHE_TTL.STOCK_BASIC,
-      () => this.callApi<StockBasic>('stock_basic', { ts_code: tsCode }, [
-        'ts_code', 'symbol', 'name', 'area', 'industry', 'market',
-        'list_date', 'exchange', 'curr_type', 'list_status'
-      ])
-    );
-
-    return data[0] || null;
+    try {
+      const data = await this.callApiWithCache<StockBasic[]>(
+        cacheKey,
+        CACHE_TTL.STOCK_BASIC,
+        () => this.callApi<StockBasic>('stock_basic', { ts_code: tsCode }, [
+          'ts_code', 'symbol', 'name', 'area', 'industry', 'market',
+          'list_date', 'exchange', 'curr_type', 'list_status'
+        ])
+      );
+      return data[0] || null;
+    } catch (error) {
+      console.warn(`[Tushare] stock_basic API调用失败: ${error}`);
+      return null;
+    }
   }
 
   /**
@@ -240,18 +244,23 @@ export class TushareService {
     
     const ttl = isToday ? CACHE_TTL.DAILY_TODAY : CACHE_TTL.DAILY_HISTORY;
 
-    return this.callApiWithCache(
-      cacheKey,
-      ttl,
-      () => this.callApi<DailyData>('daily', {
-        ts_code: tsCode,
-        start_date: startDate,
-        end_date: endDate,
-      }, [
-        'ts_code', 'trade_date', 'open', 'high', 'low', 'close',
-        'pre_close', 'change', 'pct_chg', 'vol', 'amount'
-      ])
-    );
+    try {
+      return await this.callApiWithCache(
+        cacheKey,
+        ttl,
+        () => this.callApi<DailyData>('daily', {
+          ts_code: tsCode,
+          start_date: startDate,
+          end_date: endDate,
+        }, [
+          'ts_code', 'trade_date', 'open', 'high', 'low', 'close',
+          'pre_close', 'change', 'pct_chg', 'vol', 'amount'
+        ])
+      );
+    } catch (error) {
+      console.warn(`[Tushare] daily API调用失败: ${error}`);
+      return [];
+    }
   }
 
   /**
@@ -429,31 +438,40 @@ export class TushareService {
   async getCompanyInfo(tsCode: string): Promise<CompanyInfo | null> {
     const cacheKey = CacheKeys.company(tsCode);
     
-    const data = await this.callApiWithCache<CompanyInfo[]>(
-      cacheKey,
-      CACHE_TTL.COMPANY,
-      () => this.callApi<CompanyInfo>('stock_company', { ts_code: tsCode }, [
-        'ts_code', 'exchange', 'chairman', 'manager', 'secretary',
-        'reg_capital', 'setup_date', 'province', 'city', 'introduction',
-        'website', 'email', 'office', 'employees', 'main_business'
-      ])
-    );
-
-    return data[0] || null;
+    try {
+      const data = await this.callApiWithCache<CompanyInfo[]>(
+        cacheKey,
+        CACHE_TTL.COMPANY,
+        () => this.callApi<CompanyInfo>('stock_company', { ts_code: tsCode }, [
+          'ts_code', 'exchange', 'chairman', 'manager', 'secretary',
+          'reg_capital', 'setup_date', 'province', 'city', 'introduction',
+          'website', 'email', 'office', 'employees', 'main_business'
+        ])
+      );
+      return data[0] || null;
+    } catch (error) {
+      console.warn(`[Tushare] stock_company API调用失败: ${error}`);
+      return null;
+    }
   }
 
   /**
    * 获取每日指标
    */
   async getDailyBasic(tsCode: string, tradeDate?: string): Promise<DailyBasicData[]> {
-    return this.callApi<DailyBasicData>('daily_basic', {
-      ts_code: tsCode,
-      trade_date: tradeDate,
-    }, [
-      'ts_code', 'trade_date', 'close', 'turnover_rate', 'volume_ratio',
-      'pe', 'pe_ttm', 'pb', 'ps', 'ps_ttm', 'dv_ratio', 'dv_ttm',
-      'total_share', 'float_share', 'free_share', 'total_mv', 'circ_mv'
-    ]);
+    try {
+      return await this.callApi<DailyBasicData>('daily_basic', {
+        ts_code: tsCode,
+        trade_date: tradeDate,
+      }, [
+        'ts_code', 'trade_date', 'close', 'turnover_rate', 'volume_ratio',
+        'pe', 'pe_ttm', 'pb', 'ps', 'ps_ttm', 'dv_ratio', 'dv_ttm',
+        'total_share', 'float_share', 'free_share', 'total_mv', 'circ_mv'
+      ]);
+    } catch (error) {
+      console.warn(`[Tushare] daily_basic API调用失败: ${error}`);
+      return [];
+    }
   }
 
   // ========== 新增4个高级接口（需要5000积分） ==========
