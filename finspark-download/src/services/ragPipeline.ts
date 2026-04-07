@@ -734,8 +734,9 @@ export class PipelineService {
     chunks: MergedChunk[],
     rerankWeight: number
   ): Promise<MergedChunk[]> {
-    // 限制重排数量（避免 token 消耗过大）
-    const toRerank = chunks.slice(0, 10);
+    // 限制重排数量（v10: 降为 6 以适配 Workers CPU 限制 —— sub-query + rerank + scoring 组合
+    // 在 300s cpu_ms 内需完成，10 个 chunk 的并行 LLM 调用可能超限）
+    const toRerank = chunks.slice(0, 6);
 
     // 获取 LLM 配置用于重排（如果 GPU 可用则用 GPU，否则用 Cloud）
     const rerankLlmConfig = this.gpuProvider?.getLlmConfig('rerank') || {
