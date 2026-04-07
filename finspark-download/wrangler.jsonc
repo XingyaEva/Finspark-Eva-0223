@@ -4,11 +4,13 @@
   "compatibility_date": "2024-12-30",
   "pages_build_output_dir": "./dist",
   "compatibility_flags": ["nodejs_compat"],
-  
-  // 启用 Workers Unbound 模式（需要 Cloudflare Workers Paid 计划）
-  // 允许更长的 CPU 执行时间（最高30秒），适合漫画生成等计算密集型任务
-  // 如果您使用的是免费计划，请注释掉此行
-  // "usage_model": "unbound",
+
+  // CPU 时间限制：提高到 5 分钟（300,000ms），需要 Workers Paid 计划（$5/月）
+  // 默认 30 秒，评估任务（每题 4 次 LLM 调用）经常超时
+  // 参考：https://developers.cloudflare.com/workers/platform/limits/#cpu-time
+  "limits": {
+    "cpu_ms": 300000
+  },
 
   // D1 数据库（股票数据、用户数据、分析报告持久化）
   "d1_databases": [
