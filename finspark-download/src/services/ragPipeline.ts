@@ -35,7 +35,7 @@ export interface EnhancedRAGConfig {
 
 export const DEFAULT_ENHANCED_CONFIG: EnhancedRAGConfig = {
   enableBm25: true,
-  enableRerank: false,          // 默认关闭 LLM 重排
+  enableRerank: true,           // v10: 启用 LLM 重排，过滤噪声 chunk 提升 Sufficiency
   topK: 8,                      // v5: increased from 5 to 8 for better recall
   minScore: 0.20,               // v5: lowered from 0.25 to capture more candidates
   rerankWeight: 0.7,
@@ -199,85 +199,118 @@ export class PipelineService {
         }
       }
 
-      // ② 并行检索（向量 + BM25）
-      const retrievalPromises: Array<Promise<void>> = [];
+      // ② 检索（支持 Sub-Query 多轮检索）
+      //
+      // 当意图为 comparative 且 Intent 层拆出了 subQueries 时：
+      //   对主查询 + 每个 sub-query 并行检索，结果合并去重，多次命中的 chunk 加 boost。
+      //   这对"比亚迪和海螺水泥行业环境差异"这类跨公司对比题至关重要——
+      //   单次检索只能召回一家公司的内容，sub-query 多轮检索可覆盖所有对比对象。
+      //
+      // 其他题型：保持原有单查询逻辑不变。
 
-      // 向量检索
-      const vectorStart = Date.now();
-      retrievalPromises.push(
-        this.ragService
-          .searchSimilar(searchQuery, {
-            topK: config.topK * 2, // 多取一些再合并
-            minScore: config.minScore,
-            stockCode: config.stockCode,
-            documentIds: config.documentIds,
-          })
-          .then((results) => {
-            vectorResults = results;
-            vectorLatency = Date.now() - vectorStart;
-          })
-      );
+      const hasSubQueries = intentResult.subQueries && intentResult.subQueries.length >= 2;
+      const allQueries = hasSubQueries
+        ? [searchQuery, ...intentResult.subQueries!]  // 主查询 + 子查询
+        : [searchQuery];
 
-      // 全文检索：优先 FTS5，降级 BM25（如果启用）
-      if (config.enableBm25) {
-        const bm25Start = Date.now();
-        
-        // 优先使用 FTS5（单次查询，~5ms）
-        if (this.fts5Service) {
-          retrievalPromises.push(
-            this.fts5Service
-              .search(searchQuery, {
-                topK: config.topK * 2,
-                documentIds: config.documentIds,
-                stockCode: config.stockCode,
-              })
-              .then((fts5Results) => {
-                // 将 FTS5 结果转为 BM25SearchResult 格式（兼容下游 mergeAndDedup）
-                bm25Results = fts5Results.map(r => ({
-                  chunkId: r.chunkId,
-                  documentId: r.documentId,
-                  score: r.score,
-                  content: r.content,
-                  matchedTokens: [], // FTS5 不返回匹配的 token 列表
-                }));
-                bm25Latency = Date.now() - bm25Start;
-                console.log(`[Pipeline] FTS5 search: ${bm25Results.length} results in ${bm25Latency}ms`);
-              })
-              .catch((fts5Error) => {
-                console.warn('[Pipeline] FTS5 failed, falling back to BM25:', fts5Error);
-                // 降级到旧 BM25
-                return this.bm25Service
-                  .search(searchQuery, {
-                    topK: config.topK * 2,
-                    documentIds: config.documentIds,
-                    stockCode: config.stockCode,
-                  })
-                  .then((results) => {
-                    bm25Results = results;
-                    bm25Latency = Date.now() - bm25Start;
-                  });
-              })
-          );
-        } else {
-          // FTS5 不可用，直接用旧 BM25
-          retrievalPromises.push(
-            this.bm25Service
-              .search(searchQuery, {
-                topK: config.topK * 2,
-                documentIds: config.documentIds,
-                stockCode: config.stockCode,
-              })
-              .then((results) => {
-                bm25Results = results;
-                bm25Latency = Date.now() - bm25Start;
-              })
-          );
-        }
+      if (hasSubQueries) {
+        console.log(`[Pipeline] Sub-query decomposition: ${allQueries.length} queries = main + ${intentResult.subQueries!.length} subs: ${intentResult.subQueries!.join(' | ')}`);
       }
 
-      await Promise.all(retrievalPromises);
+      // 对每个查询做并行检索，收集所有结果
+      const allVectorResults: ChunkWithScore[] = [];
+      const allBm25Results: BM25SearchResult[] = [];
+      const retrievalStart = Date.now();
 
-      // ③ 去重合并
+      // 每个 sub-query 的 topK 较小（避免总量爆炸），主查询保持完整 topK
+      const perQueryTopK = hasSubQueries
+        ? Math.max(4, Math.ceil(config.topK * 1.5))  // sub-query 模式：每个查询取较少
+        : config.topK * 2;                             // 单查询模式：保持原逻辑
+
+      const queryPromises = allQueries.map((q, qIdx) => {
+        const isMainQuery = qIdx === 0;
+        const qTopK = isMainQuery ? config.topK * 2 : perQueryTopK;
+        const promises: Array<Promise<void>> = [];
+
+        // 向量检索
+        promises.push(
+          this.ragService
+            .searchSimilar(q, {
+              topK: qTopK,
+              minScore: config.minScore,
+              stockCode: config.stockCode,
+              documentIds: config.documentIds,
+            })
+            .then((results) => {
+              allVectorResults.push(...results);
+            })
+        );
+
+        // 全文检索（如果启用）
+        if (config.enableBm25) {
+          if (this.fts5Service) {
+            promises.push(
+              this.fts5Service
+                .search(q, {
+                  topK: qTopK,
+                  documentIds: config.documentIds,
+                  stockCode: config.stockCode,
+                })
+                .then((fts5Results) => {
+                  allBm25Results.push(...fts5Results.map(r => ({
+                    chunkId: r.chunkId,
+                    documentId: r.documentId,
+                    score: r.score,
+                    content: r.content,
+                    matchedTokens: [],
+                  })));
+                })
+                .catch((fts5Error) => {
+                  console.warn(`[Pipeline] FTS5 failed for query #${qIdx}, falling back to BM25:`, fts5Error);
+                  return this.bm25Service
+                    .search(q, {
+                      topK: qTopK,
+                      documentIds: config.documentIds,
+                      stockCode: config.stockCode,
+                    })
+                    .then((results) => {
+                      allBm25Results.push(...results);
+                    });
+                })
+            );
+          } else {
+            promises.push(
+              this.bm25Service
+                .search(q, {
+                  topK: qTopK,
+                  documentIds: config.documentIds,
+                  stockCode: config.stockCode,
+                })
+                .then((results) => {
+                  allBm25Results.push(...results);
+                })
+            );
+          }
+        }
+
+        return Promise.all(promises);
+      });
+
+      // 所有查询并行执行
+      await Promise.all(queryPromises);
+
+      vectorResults = allVectorResults;
+      bm25Results = allBm25Results;
+      vectorLatency = Date.now() - retrievalStart;
+      bm25Latency = vectorLatency; // 混合计时
+
+      if (hasSubQueries) {
+        console.log(`[Pipeline] Sub-query retrieval complete: ${allVectorResults.length} vector + ${allBm25Results.length} bm25 results from ${allQueries.length} queries in ${vectorLatency}ms`);
+      } else {
+        console.log(`[Pipeline] Single-query retrieval: ${allVectorResults.length} vector + ${allBm25Results.length} bm25 in ${vectorLatency}ms`);
+      }
+
+      // ③ 去重合并（多次命中同一 chunk 时 mergeAndDedup 自动加 boost）
       const merged = this.mergeAndDedup(vectorResults, bm25Results);
 
       // ④ 重排（可选：优先用专用 BGE-Reranker，回退用 LLM 重排）
@@ -487,22 +520,29 @@ export class PipelineService {
     const mergedMap = new Map<number, MergedChunk>();
 
     // 添加向量检索结果（自带 chunkIndex）
+    // Sub-query 场景下同一 chunk 可能被多个查询命中 — 保留最高分并加 boost
     for (const vr of vectorResults) {
       const chunkId = vr.chunk.id!;
       const meta = (vr.chunk.metadata || {}) as Record<string, any>;
-      mergedMap.set(chunkId, {
-        chunkId,
-        chunkIndex: vr.chunk.chunkIndex,
-        documentId: vr.documentId,
-        documentTitle: vr.documentTitle || '',
-        content: vr.chunk.content,
-        score: vr.score,
-        pageRange: meta.pageStart ? `${meta.pageStart}${meta.pageEnd && meta.pageEnd !== meta.pageStart ? '-' + meta.pageEnd : ''}` : meta.pageRange,
-        heading: meta.heading,
-        chunkType: meta.chunkType,
-        sourceFile: meta.sourceFile,
-        source: 'vector',
-      });
+      const existing = mergedMap.get(chunkId);
+      if (existing) {
+        // 同一 chunk 被多个 sub-query 命中 — 加 boost 并取最高分
+        existing.score = Math.min(1.0, Math.max(existing.score, vr.score) + 0.05);
+      } else {
+        mergedMap.set(chunkId, {
+          chunkId,
+          chunkIndex: vr.chunk.chunkIndex,
+          documentId: vr.documentId,
+          documentTitle: vr.documentTitle || '',
+          content: vr.chunk.content,
+          score: vr.score,
+          pageRange: meta.pageStart ? `${meta.pageStart}${meta.pageEnd && meta.pageEnd !== meta.pageStart ? '-' + meta.pageEnd : ''}` : meta.pageRange,
+          heading: meta.heading,
+          chunkType: meta.chunkType,
+          sourceFile: meta.sourceFile,
+          source: 'vector',
+        });
+      }
     }
 
     // 合并 BM25 检索结果
@@ -803,27 +843,128 @@ export class PipelineService {
       });
     }
 
-    const intentHint =
-      intent.type === 'number'
-        ? '用户在查询具体数值，请确保引用原文中的精确数字。'
-        : intent.type === 'boolean'
-          ? '用户需要一个明确的是/否判断，请给出清晰结论。'
-          : intent.type === 'comparative'
-            ? '用户在进行对比分析，请分别列出各对象的数据后给出比较结论。'
-            : '';
+    // ============ P2: 深度 Prompt 模板分题型定制 ============
+    // 针对 6 种 intent 类型设计差异化的 system prompt，
+    // 分别优化 Faithfulness、ExactMatch、Semantic 和 Sufficiency 等维度。
+
+    const contextBlock = context
+      ? '【知识库检索结果】\n' + context
+      : '当前知识库中没有找到与问题高度相关的文档。';
+
+    // 通用基础规则（所有题型共享）
+    const baseRules = `基础规则：
+- **严格基于**知识库中的文档内容回答，不得捏造、推测或补充文档中不存在的数据
+- 如果检索结果中没有足够信息回答问题，明确说明"根据当前检索到的文档，未找到XXX相关数据"
+- 在回答末尾标注参考来源，格式如：📄 文档名称 · 第X页 · 章节名`;
+
+    // 按题型生成差异化的回答策略
+    let intentPrompt: string;
+    switch (intent.type) {
+      case 'number':
+        intentPrompt = `【回答策略 — 数值查询】
+你需要回答一个关于具体数值的问题。
+
+回答要求：
+1. **精确引用**原文中的数字，绝不四舍五入、单位换算或近似处理
+2. 如果原文使用"万元"，回答中也必须使用"万元"；如果原文使用"%"，回答也用"%"
+3. 必须给出数字的出处（哪份文档、哪一页、哪个表格/段落）
+4. 如果有多个年度/期间的数据，列出所有相关数值供用户参考
+5. 若检索结果中不存在该数值，明确说明"未找到"，不要推算或编造
+
+回答格式：
+- 先给出直接数值答案
+- 然后引用原文出处
+- 如有相关的上下文数据（同比、环比等），一并列出`;
+        break;
+
+      case 'name':
+        intentPrompt = `【回答策略 — 名称/实体查询】
+你需要回答一个关于具体名称或实体的问题（如高管姓名、子公司名称、审计机构等）。
+
+回答要求：
+1. 给出**准确的全称**，不要缩写或简化
+2. 如果原文有职位/角色信息，一并给出
+3. 如果存在多个符合条件的实体，全部列出
+4. 明确标注信息来源的文档和页码
+
+回答格式：
+- 直接给出名称/实体答案
+- 标注出处和上下文`;
+        break;
+
+      case 'boolean':
+        intentPrompt = `【回答策略 — 是/否判断】
+你需要回答一个需要明确结论的判断性问题。
+
+回答要求：
+1. **先给出明确结论**：是/否/是的/不是（不要模棱两可）
+2. 然后给出支撑结论的**具体数据或原文引用**
+3. 如果证据不充分，说明"根据已检索文档，倾向于……但信息不完整"
+4. 不要在没有证据的情况下给出肯定或否定结论
+
+回答格式：
+- 第一句话：明确结论
+- 后续：引用支撑数据和出处`;
+        break;
+
+      case 'comparative':
+        intentPrompt = `【回答策略 — 对比分析】
+你需要回答一个涉及多个对象/指标/时间段对比的问题。
+
+回答要求：
+1. **逐一列出**每个对比对象的相关数据，确保覆盖所有被比较的对象
+2. 使用**结构化格式**（表格或分点列举）呈现对比数据
+3. 每个数据点都必须标注来源（哪份文档、第几页）
+4. 在列出数据后给出**明确的比较结论**
+5. 如果某个对比对象的数据缺失，明确指出"未找到XX公司/指标的数据"
+6. 不要只回答部分对象——如果问A和B的对比，必须同时回答A和B
+
+回答格式：
+**[对象A]：**
+- 指标1：数值 (出处)
+- 指标2：数值 (出处)
+
+**[对象B]：**
+- 指标1：数值 (出处)
+- 指标2：数值 (出处)
+
+**比较结论：** ……`;
+        break;
+
+      case 'open':
+        intentPrompt = `【回答策略 — 开放性分析】
+你需要回答一个开放性的分析问题（如竞争优势、风险分析、发展前景等）。
+
+回答要求：
+1. 回答必须**有理有据**，每个观点都要有检索文档中的数据或原文支撑
+2. 使用分点式结构组织回答，逻辑清晰
+3. 区分"文档中明确提到的事实"和"基于事实的合理推断"
+4. 如果检索内容不足以做全面分析，说明信息覆盖范围的局限性
+5. 不要添加与检索文档无关的通用行业知识
+
+回答格式：
+- 分层次、分角度展开
+- 每个观点附带数据/出处支撑
+- 最后给出综合评价（如有足够信息）`;
+        break;
+
+      default: // 'string' 或未知类型
+        intentPrompt = `【回答策略 — 通用查询】
+回答要求：
+1. 基于检索到的文档内容准确回答
+2. 引用具体来源（文档名称、页码、章节）
+3. 确保每个关键数据点都能在检索结果中找到出处
+4. 使用专业但易懂的中文回答`;
+        break;
+    }
 
     const systemPrompt = `你是Finspark AI财报知识库助手。你严格基于知识库中的公司财报文档回答用户问题。
 
-${context ? '【知识库检索结果】\n' + context : '当前知识库中没有找到与问题高度相关的文档。'}
+${contextBlock}
 
-${intentHint ? '【提示】' + intentHint + '\n' : ''}
-回答规则：
-1. **严格基于**知识库中的文档内容回答，不得捏造、推测或补充文档中不存在的数据
-2. 引用具体来源（文档名称、页码、章节），确保每个关键数据点都能在检索结果中找到出处
-3. 如果检索结果中没有足够信息回答问题，明确说明"根据当前检索到的文档，未找到XXX相关数据"，不要编造数字
-4. 对于数值型问题，务必准确引用原文中的数字，不要四舍五入或换算（除非同时标注原始数值）
-5. 使用专业但易懂的中文回答
-6. 在回答末尾标注参考来源，格式如：📄 文档名称 · 第X页 · 章节名`;
+${intentPrompt}
+
+${baseRules}`;
 
     const messages = [
       { role: 'system', content: systemPrompt },
