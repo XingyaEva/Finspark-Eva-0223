@@ -807,7 +807,10 @@ ${chunkTexts}`;
   }> {
     const expected = question.expected_answer.trim();
     const actual = (result.answer || '').trim();
-    const contextText = this.buildContextForFaithfulness(result.sources);
+
+    // P1: 按 relevanceScore 降序排列 sources，确保截断时优先保留高质量 source
+    const sortedSources = [...result.sources].sort((a, b) => (b.relevanceScore || 0) - (a.relevanceScore || 0));
+    const contextText = this.buildContextForScoring(sortedSources);
 
     // ==================== 并行 LLM 打分 (4 项同时调用，提速 ~3x) ====================
     // 将 4 个独立的 LLM 评分调用从串行改为并行执行
@@ -820,6 +823,7 @@ ${chunkTexts}`;
       faithfulnessResult,
     ] = await Promise.all([
       // R1. Context Sufficiency — chunks 拼接后能否完整回答问题 (LLM)
+      // 使用与 faithfulness 相同的排序后 context，确保高相关 source 优先
       (async () => {
         try {
           if (contextText) {
@@ -950,21 +954,53 @@ ${chunkTexts}`;
   }
 
   /**
-   * 构建 faithfulness 检测所需的 context 文本（拼接 chunk 内容）
+   * 构建 LLM 打分所需的 context 文本（拼接 chunk 内容）
+   *
+   * v10.3 修复: 返回全部 chunks 后，8 个 source 的 context 可达 27,000-38,000 字符。
+   * 旧版限制 6000 字符只能容纳 1-2 个 source，导致:
+   *   - faithfulness 误判（支撑信息被截断，评委看不到依据 → 评 0-10%）
+   *   - context sufficiency 误判（跨公司对比题只保留一方数据 → 评 10%）
+   * 
+   * 修复策略:
+   *   1. 调用方先按 relevanceScore 降序排序，高相关 source 优先保留
+   *   2. 每个 source 截取前 1500 字符（足够保留关键信息，去除冗余细节）
+   *   3. 总上限 12000 字符（gpt-4.1-mini 128k context，12k 仅占 ~9%）
    */
-  private buildContextForFaithfulness(
+  private buildContextForScoring(
     sources: { chunkContent?: string; documentTitle?: string; relevanceScore: number }[]
   ): string {
+    const MAX_PER_SOURCE = 1500;  // 每个 source 保留的最大字符数
+    const MAX_TOTAL = 12000;      // context 总上限
+
     const parts: string[] = [];
+    let totalLen = 0;
+
     for (const s of sources) {
-      if (s.chunkContent) {
-        const title = s.documentTitle ? `[${s.documentTitle}] ` : '';
-        parts.push(`${title}${s.chunkContent}`);
+      if (!s.chunkContent) continue;
+
+      const title = s.documentTitle ? `[${s.documentTitle}] ` : '';
+      // 截取每个 source 的前 MAX_PER_SOURCE 字符
+      const content = s.chunkContent.length > MAX_PER_SOURCE
+        ? s.chunkContent.slice(0, MAX_PER_SOURCE) + `...(全文${s.chunkContent.length}字)`
+        : s.chunkContent;
+      const part = `${title}${content}`;
+
+      // 检查是否会超出总上限
+      const separator = parts.length > 0 ? '\n---\n' : '';
+      if (totalLen + separator.length + part.length > MAX_TOTAL) {
+        // 还有剩余空间的话，放入部分内容
+        const remaining = MAX_TOTAL - totalLen - separator.length;
+        if (remaining > 200) {  // 至少 200 字符才值得放入
+          parts.push(part.slice(0, remaining) + '...');
+        }
+        break;
       }
+
+      parts.push(part);
+      totalLen += separator.length + part.length;
     }
-    // Limit to ~6000 chars to keep LLM call manageable
-    const joined = parts.join('\n---\n');
-    return joined.length > 6000 ? joined.slice(0, 6000) + '...' : joined;
+
+    return parts.join('\n---\n');
   }
 
   // ============================================================
