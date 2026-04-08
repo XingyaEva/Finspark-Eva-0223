@@ -619,6 +619,68 @@ ragEnhance.post('/evaluations/:id/finalize', async (c) => {
 });
 
 /**
+ * POST /evaluations/:id/run-one — 单题评测（外部脚本驱动）
+ * Body: { questionId: number }
+ * 
+ * 设计目的：绕过 Cloudflare Workers 30s 超时限制
+ * 外部脚本逐题调用此 API，每次只处理一个问题（RAG 查询 ~10s + 并行打分 ~30s ≈ 40s）
+ * 幂等：若该题已有结果则直接返回，不重复评测
+ */
+ragEnhance.post('/evaluations/:id/run-one', async (c) => {
+  try {
+    const svc = createTestSetServiceFromEnv(c.env);
+    const pipelineService = createPipelineForEval(c.env);
+    const id = parseInt(c.req.param('id'));
+    if (!id) return c.json({ success: false, error: '无效的评测 ID' }, 400);
+
+    const body = await c.req.json();
+    const questionId = body.questionId;
+    if (!questionId) return c.json({ success: false, error: '缺少 questionId' }, 400);
+
+    // Build RAG query function (same as run endpoint)
+    const ragQueryFn = async (question: string, config: any) => {
+      const start = Date.now();
+      const result = await pipelineService.enhancedQuery({
+        question,
+        config: {
+          enableBm25: config.searchStrategy !== 'vector',
+          enableRerank: config.enableRerank || false,
+          topK: config.topK || 5,
+          minScore: config.minScore || 0.25,
+          contextMode: config.contextMode || 'none',
+          contextWindow: config.contextWindow ?? 1,
+        },
+      });
+
+      return {
+        answer: result.answer,
+        sources: result.sources.map(s => ({
+          documentId: s.documentId,
+          chunkId: s.chunkId || 0,
+          pageRange: s.pageRange,
+          relevanceScore: s.relevanceScore,
+          chunkContent: s._fullContent || s.chunkContent || '',
+          documentTitle: s.documentTitle || '',
+        })),
+        latencyMs: Date.now() - start,
+        tokensInput: 0,
+        tokensOutput: 0,
+      };
+    };
+
+    const result = await svc.runSingleQuestion(id, questionId, ragQueryFn);
+
+    return c.json({
+      success: true,
+      ...result,
+    });
+  } catch (error) {
+    console.error('[RAG Enhance] Run single question error:', error);
+    return c.json({ success: false, error: '单题评测失败: ' + (error as Error).message }, 500);
+  }
+});
+
+/**
  * GET /evaluations — 获取评测列表
  * Query: ?testSetId=&status=&limit=20&offset=0
  */

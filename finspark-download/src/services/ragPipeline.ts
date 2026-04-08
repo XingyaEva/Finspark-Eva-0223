@@ -719,13 +719,16 @@ export class PipelineService {
     const results = await this.gpuProvider!.dedicatedRerank(query, documents, toRerank.length);
 
     // 融合 Reranker 分数和原始分数
-    return results.map(r => {
+    const reranked = results.map(r => {
       const original = toRerank[r.index];
       return {
         ...original,
         score: rerankWeight * r.score + (1 - rerankWeight) * original.score,
       };
-    }).sort((a, b) => b.score - a.score);
+    });
+    // 合并：rerank 过的 top-10 + 未 rerank 的其余 chunks（保留原始分数）
+    const remaining = chunks.slice(10);
+    return [...reranked, ...remaining].sort((a, b) => b.score - a.score);
   }
 
   // ==================== LLM 重排 ====================

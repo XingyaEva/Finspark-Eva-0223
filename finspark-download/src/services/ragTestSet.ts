@@ -809,32 +809,76 @@ ${chunkTexts}`;
     const actual = (result.answer || '').trim();
     const contextText = this.buildContextForFaithfulness(result.sources);
 
-    // ==================== 检索层评分 ====================
+    // ==================== 并行 LLM 打分 (4 项同时调用，提速 ~3x) ====================
+    // 将 4 个独立的 LLM 评分调用从串行改为并行执行
+    // 串行: ~120s (4 × 30s) → 并行: ~30s (max of 4 calls)
 
-    // R1. Context Sufficiency — chunks 拼接后能否完整回答问题 (LLM)
-    let contextSufficiencyScore = 50;
-    try {
-      if (contextText) {
-        contextSufficiencyScore = await this.llmContextSufficiency(
-          question.question, expected, contextText
-        );
-      }
-    } catch (err) {
-      console.warn('[Eval] Context sufficiency scoring failed:', err);
-    }
+    const [
+      contextSufficiencyResult,
+      chunkIntegrityResult,
+      semanticResult,
+      faithfulnessResult,
+    ] = await Promise.all([
+      // R1. Context Sufficiency — chunks 拼接后能否完整回答问题 (LLM)
+      (async () => {
+        try {
+          if (contextText) {
+            return await this.llmContextSufficiency(question.question, expected, contextText);
+          }
+          return 50;
+        } catch (err) {
+          console.warn('[Eval] Context sufficiency scoring failed:', err);
+          return 50;
+        }
+      })(),
+
+      // R3. Chunk Integrity — 切片是否语义完整 (LLM)
+      (async () => {
+        try {
+          if (result.sources.length > 0) {
+            return await this.llmChunkIntegrity(result.sources);
+          }
+          return 50;
+        } catch (err) {
+          console.warn('[Eval] Chunk integrity scoring failed:', err);
+          return 50;
+        }
+      })(),
+
+      // G1. Semantic — 语义正确性 (LLM)
+      (async () => {
+        try {
+          return await this.llmSemanticScore(
+            question.question, expected, actual, question.question_type, question.difficulty
+          );
+        } catch {
+          return this.simpleOverlapScore(expected, actual);
+        }
+      })(),
+
+      // G3. Faithfulness — 忠实度 (LLM)
+      (async () => {
+        try {
+          if (contextText && actual) {
+            return await this.llmFaithfulnessScore(question.question, actual, contextText);
+          }
+          return 50;
+        } catch (err) {
+          console.warn('[Eval] Faithfulness scoring failed, using fallback:', err);
+          return result.sources.length > 0 ? 60 : 30;
+        }
+      })(),
+    ]);
+
+    const contextSufficiencyScore = contextSufficiencyResult;
+    const chunkIntegrityScore = chunkIntegrityResult;
+    const semanticScore = semanticResult;
+    const faithfulnessScore = faithfulnessResult;
+
+    // ==================== 纯算法评分 (无需 LLM，立即返回) ====================
 
     // R2. Chunk Relevance — Top-K 排序质量 (Precision@3 + score distribution)
     const chunkRelevanceScore = this.computeChunkRelevance(result.sources);
-
-    // R3. Chunk Integrity — 切片是否语义完整 (LLM)
-    let chunkIntegrityScore = 50;
-    try {
-      if (result.sources.length > 0) {
-        chunkIntegrityScore = await this.llmChunkIntegrity(result.sources);
-      }
-    } catch (err) {
-      console.warn('[Eval] Chunk integrity scoring failed:', err);
-    }
 
     // R4. Recall — 检索召回率
     let recallScore = 0;
@@ -853,18 +897,6 @@ ${chunkTexts}`;
       recallScore = 30;
     }
 
-    // ==================== 生成层评分 ====================
-
-    // G1. Semantic — 语义正确性 (LLM)
-    let semanticScore = 0;
-    try {
-      semanticScore = await this.llmSemanticScore(
-        question.question, expected, actual, question.question_type, question.difficulty
-      );
-    } catch {
-      semanticScore = this.simpleOverlapScore(expected, actual);
-    }
-
     // G2. Exact Match — 精确匹配（连续分数，非二值）
     let isCorrect = false;
     let exactMatchScore = 0;
@@ -877,19 +909,6 @@ ${chunkTexts}`;
       isCorrect = semanticScore >= 80;
     }
     if (semanticScore >= 80) isCorrect = true;
-
-    // G3. Faithfulness — 忠实度
-    let faithfulnessScore = 50;
-    try {
-      if (contextText && actual) {
-        faithfulnessScore = await this.llmFaithfulnessScore(
-          question.question, actual, contextText
-        );
-      }
-    } catch (err) {
-      console.warn('[Eval] Faithfulness scoring failed, using fallback:', err);
-      faithfulnessScore = result.sources.length > 0 ? 60 : 30;
-    }
 
     // Citation (legacy, kept for backward compat but 0% weight)
     let citationScore = 0;
@@ -1455,6 +1474,100 @@ ${answer}
       "SELECT * FROM rag_evaluations WHERE test_set_id = ? AND status = 'completed' ORDER BY created_at ASC"
     ).bind(testSetId).all();
     return (rows.results || []) as unknown as Evaluation[];
+  }
+
+  /**
+   * 单题评测 — 外部脚本逐题调用，避免 Workers 超时
+   * 执行流程: RAG 查询 → 并行 LLM 打分 → 写入 D1 → 更新进度
+   * 每次调用只处理一个问题，由外部脚本循环驱动
+   */
+  async runSingleQuestion(
+    evaluationId: number,
+    questionId: number,
+    ragQueryFn: (question: string, config: any) => Promise<{
+      answer: string;
+      sources: { documentId: number; chunkId: number; pageRange?: string; relevanceScore: number; chunkContent?: string; documentTitle?: string }[];
+      latencyMs: number;
+      tokensInput: number;
+      tokensOutput: number;
+    }>
+  ): Promise<{
+    questionId: number;
+    score: number;
+    isCorrect: boolean;
+    reason: string;
+    latencyMs: number;
+  }> {
+    const evaluation = await this.getEvaluation(evaluationId);
+    const config: EvalConfig = JSON.parse(evaluation.config_json);
+    const question = await this.getQuestion(questionId);
+
+    // Check if already scored (idempotent)
+    const existing = await this.db.prepare(
+      'SELECT id, score, is_correct, scoring_reason, latency_ms FROM rag_evaluation_results WHERE evaluation_id = ? AND question_id = ?'
+    ).bind(evaluationId, questionId).first();
+    if (existing) {
+      return {
+        questionId,
+        score: (existing.score as number) || 0,
+        isCorrect: (existing.is_correct as number) === 1,
+        reason: (existing.scoring_reason as string) || '',
+        latencyMs: (existing.latency_ms as number) || 0,
+      };
+    }
+
+    // Mark evaluation as running if pending
+    if (evaluation.status === 'pending') {
+      await this.db.prepare(
+        "UPDATE rag_evaluations SET status = 'running', started_at = datetime('now') WHERE id = ?"
+      ).bind(evaluationId).run();
+    }
+
+    // Execute RAG query
+    const result = await ragQueryFn(question.question, config);
+
+    // Score (uses parallel Promise.all internally)
+    const scoring = await this.scoreResult(question, result);
+
+    // Write result to D1
+    await this.db.prepare(
+      `INSERT INTO rag_evaluation_results
+       (evaluation_id, question_id, question_text, question_type, difficulty, expected_answer, model_answer, score, is_correct, scoring_reason, retrieval_results, sources_used, latency_ms, tokens_input, tokens_output)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      evaluationId, questionId, question.question, question.question_type, question.difficulty,
+      question.expected_answer, result.answer, scoring.overallScore,
+      scoring.isCorrect ? 1 : 0, scoring.reason,
+      JSON.stringify(result.sources), JSON.stringify(result.sources),
+      result.latencyMs, result.tokensInput, result.tokensOutput
+    ).run();
+
+    // Update completed count
+    const countResult = await this.db.prepare(
+      'SELECT COUNT(DISTINCT question_id) as cnt FROM rag_evaluation_results WHERE evaluation_id = ?'
+    ).bind(evaluationId).first();
+    const completed = (countResult?.cnt as number) || 0;
+
+    await this.db.prepare(
+      'UPDATE rag_evaluations SET completed_questions = ? WHERE id = ?'
+    ).bind(completed, evaluationId).run();
+
+    // Update KV progress
+    const { questions } = await this.listQuestions(evaluation.test_set_id, { limit: 500 });
+    await this.cache.put(`eval:${evaluationId}`, JSON.stringify({
+      status: 'running',
+      completed,
+      total: questions.length,
+      percentage: Math.round((completed / questions.length) * 100),
+    }), { expirationTtl: 3600 });
+
+    return {
+      questionId,
+      score: scoring.overallScore,
+      isCorrect: scoring.isCorrect,
+      reason: scoring.reason,
+      latencyMs: result.latencyMs,
+    };
   }
 
   async getEvalProgress(evaluationId: number): Promise<{ status: string; completed: number; total: number; percentage: number } | null> {

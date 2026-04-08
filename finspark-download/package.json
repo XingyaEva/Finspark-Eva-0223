@@ -38,7 +38,9 @@
     "sync:stocks:prod:a": "node scripts/sync_all_stocks.mjs --a-stock --full --hot --prod",
     "sync:dry-run": "node scripts/sync_all_stocks.mjs --full --dry-run",
     "sync:hk:dry-run": "node scripts/sync_hk_stocks.mjs --full --dry-run",
-    "sync:a-full": "node scripts/sync_all_stocks.mjs --a-stock --full --hot"
+    "sync:a-full": "node scripts/sync_all_stocks.mjs --a-stock --full --hot",
+    "eval:run": "node scripts/run-eval.mjs",
+    "eval:run-all": "node scripts/run-eval.mjs --eval-id"
   },
   "dependencies": {
     "exceljs": "^4.4.0",
