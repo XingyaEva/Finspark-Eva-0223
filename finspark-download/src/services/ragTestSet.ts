@@ -1520,7 +1520,7 @@ ${answer}
   async runSingleQuestion(
     evaluationId: number,
     questionId: number,
-    ragQueryFn: (question: string, config: any) => Promise<{
+    ragQueryFn: (question: TestQuestion, config: any) => Promise<{
       answer: string;
       sources: { documentId: number; chunkId: number; pageRange?: string; relevanceScore: number; chunkContent?: string; documentTitle?: string }[];
       latencyMs: number;
@@ -1560,7 +1560,10 @@ ${answer}
     }
 
     // Execute RAG query
-    const result = await ragQueryFn(question.question, config);
+    // 注意：传递完整 question 对象（而非仅 question.question），
+    // 使 route 层可从 question.metadata.stockCode 中提取股票代码，
+    // 防止跨公司 chunk 污染（Q7 问题根因）
+    const result = await ragQueryFn(question, config);
 
     // Score (uses parallel Promise.all internally)
     const scoring = await this.scoreResult(question, result);

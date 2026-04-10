@@ -5,6 +5,7 @@
  * 1. 增强版 RAG 问答编排：意图识别 → 并行检索(向量+BM25) → 去重 → 可选LLM重排 → LLM生成 → 日志
  * 2. 文档处理 Pipeline 任务管理（进度追踪）
  * 3. 问答消息详细日志记录（rag_message_logs）
+ * 4. 混合路由支持：RAG + 工具调用（realtimeData 注入）
  *
  * LLM 重排默认关闭（用户确认：先搭建完平台测试后再决定是否开启）
  */
@@ -31,13 +32,20 @@ export interface EnhancedRAGConfig {
   // === Context Expansion（上下文扩展） ===
   contextMode: 'none' | 'adjacent' | 'parent';  // 上下文模式（默认 none = 向后兼容）
   contextWindow: number;                          // adjacent 模式窗口大小，前后各 N 个 chunk（默认 1）
+
+  // === Hybrid / Tool Calling 支持 ===
+  /**
+   * 外部实时数据注入（由路由层获取后传入，Pipeline 只负责生成）
+   * 例：股价、PE/PB、成交量等实时数据
+   */
+  realtimeData?: Record<string, unknown>;
 }
 
 export const DEFAULT_ENHANCED_CONFIG: EnhancedRAGConfig = {
   enableBm25: true,
   enableRerank: true,           // v10: 启用 LLM 重排，过滤噪声 chunk 提升 Sufficiency
-  topK: 8,                      // v5: increased from 5 to 8 for better recall
-  minScore: 0.20,               // v5: lowered from 0.25 to capture more candidates
+  topK: 9,                      // v11: increased from 8 to 9 for better chunk relevance (rel 48.9%→target 65%)
+  minScore: 0.18,               // v11: slightly lower threshold to improve recall diversity
   rerankWeight: 0.7,
   contextMode: 'adjacent',      // v5: enable adjacent context expansion by default
   contextWindow: 2,             // adjacent 模式默认前后各 2 个 chunk（更完整的上下文）
@@ -88,6 +96,8 @@ export interface EnhancedRAGResult {
   sessionId: string;
   pipeline: PipelineMetrics;
   messageLogId: number;
+  /** 路由类型（rag / realtime / hybrid / agent_report），由调用层写入 */
+  route?: string;
 }
 
 export interface PipelineTaskProgress {
@@ -357,14 +367,15 @@ export class PipelineService {
         }
       }
 
-      // ⑤ LLM 生成回答
+      // ⑤ LLM 生成回答（支持 realtimeData 注入，hybrid 路由时使用）
       const llmStart = Date.now();
       const llmResponse = await this.generateAnswer(
         params.question,
         searchQuery,
         finalChunks,
         params.conversationHistory || [],
-        intentResult
+        intentResult,
+        config.realtimeData
       );
       llmLatency = Date.now() - llmStart;
       llmInputTokens = llmResponse.inputTokens;
@@ -830,7 +841,8 @@ export class PipelineService {
     searchQuery: string,
     chunks: MergedChunk[],
     conversationHistory: Array<{ role: string; content: string }>,
-    intent: IntentResult
+    intent: IntentResult,
+    realtimeData?: Record<string, unknown>
   ): Promise<{
     answer: string;
     inputTokens: number;
@@ -860,8 +872,18 @@ export class PipelineService {
     // 针对 6 种 intent 类型设计差异化的 system prompt，
     // 分别优化 Faithfulness、ExactMatch、Semantic 和 Sufficiency 等维度。
 
-    const contextBlock = context
-      ? '【知识库检索结果】\n' + context
+    // 实时数据块（hybrid 路由时由外层注入）
+    let realtimeBlock = '';
+    if (realtimeData && Object.keys(realtimeData).length > 0) {
+      const entries = Object.entries(realtimeData)
+        .map(([k, v]) => `  ${k}: ${v}`)
+        .join('\n');
+      realtimeBlock = `\n\n【实时市场数据（截止查询时刻）】\n${entries}\n`;
+      console.log(`[Pipeline] generateAnswer: injecting realtimeData (${Object.keys(realtimeData).length} fields)`);
+    }
+
+    const contextBlock = (context || realtimeBlock)
+      ? '【知识库检索结果】\n' + context + realtimeBlock
       : '当前知识库中没有找到与问题高度相关的文档。';
 
     // 通用基础规则（所有题型共享）

@@ -22,6 +22,7 @@ import { createPdfParserService, cleanMineruMarkdown, validatePdfSize, extractSt
 import { createCninfoService } from '../services/ragCninfo';
 import { createAutoSyncService } from '../services/ragAutoSync';
 import { createGpuProvider, type GpuProvider } from '../services/ragGpuProvider';
+import { createQueryRouter } from '../services/queryRouter';
 import { authMiddleware } from '../middleware/auth';
 
 const rag = new Hono<{ Bindings: Bindings }>();
@@ -886,7 +887,7 @@ rag.post('/query/enhanced', async (c) => {
 
   try {
     const body = await c.req.json();
-    const { question, sessionId, config, conversationHistory } = body;
+    const { question, sessionId, config, conversationHistory, stockCode, forceRoute } = body;
 
     if (!question) {
       return c.json({ success: false, error: '请输入问题' }, 400);
@@ -895,10 +896,77 @@ rag.post('/query/enhanced', async (c) => {
     const userId = getUserIdFromRequest(c);
     const pipelineService = createPipelineServiceFromEnv(env);
 
+    // ── 意图路由决策 ──────────────────────────────────────────────
+    const router = createQueryRouter();
+    const routeDecision = router.decide(question, {
+      stockCode,
+      forceRoute,
+    });
+    console.log(`[RAG Enhanced] route=${routeDecision.route}, reason="${routeDecision.reason}", latency=${routeDecision.latencyMs}ms`);
+
+    // ── 实时数据获取（realtime / hybrid 路由） ────────────────────
+    let realtimeData: Record<string, unknown> | undefined;
+    if ((routeDecision.route === 'realtime' || routeDecision.route === 'hybrid') && stockCode) {
+      try {
+        // 从 AKShare/Tushare 获取实时行情（通过内部 API 代理）
+        // 此处调用已有的 /api/stock/daily-basic 接口数据，仅拉取核心字段
+        const baseUrl = env.FINSPARK_BASE_URL || 'https://finspark-financial.pages.dev';
+        const realtimeRes = await fetch(
+          `${baseUrl}/api/stock/data?code=${encodeURIComponent(stockCode)}&fields=price,pe,pb,marketCap,volume,turnoverRate`,
+          {
+            headers: { 'X-Internal-Call': '1' },
+            signal: AbortSignal.timeout(3000), // 3s 超时，避免拖慢问答
+          }
+        ).catch(() => null);
+
+        if (realtimeRes?.ok) {
+          const json = await realtimeRes.json() as any;
+          if (json?.data) realtimeData = json.data;
+          console.log(`[RAG Enhanced] realtimeData fetched for ${stockCode}: ${Object.keys(realtimeData || {}).join(', ')}`);
+        } else {
+          console.warn(`[RAG Enhanced] realtimeData fetch failed for ${stockCode}, continuing without it`);
+        }
+      } catch (rtErr) {
+        // 实时数据获取失败不阻断问答，降级为纯 RAG
+        console.warn('[RAG Enhanced] realtimeData error (non-fatal):', rtErr);
+      }
+    }
+
+    // ── agent_report 路由：短路返回，引导用户使用完整分析功能 ────
+    if (routeDecision.route === 'agent_report') {
+      const stockHint = stockCode ? `（股票代码：${stockCode}）` : '';
+      return c.json({
+        success: true,
+        answer: `您的问题需要对财报进行全面深度分析${stockHint}，这超出了即时问答的范围。\n\n**建议：** 请使用"财报分析"功能，系统将启动 12 个专业 Agent 对该公司进行完整分析，包括盈利能力、资产负债、现金流、商业模式、估值评估等，预计耗时 60-120 秒，输出专业投研报告。`,
+        sources: [],
+        sessionId: sessionId || `route-${Date.now()}`,
+        pipeline: { intent: { type: 'open', confidence: 1, entities: [], rewrittenQuery: null, latencyMs: 0 }, vectorResults: 0, bm25Results: 0, dedupCount: 0, rerankApplied: false, totalLatencyMs: routeDecision.latencyMs },
+        messageLogId: 0,
+        route: 'agent_report',
+        routeReason: routeDecision.reason,
+        // 前端可检测此标志，自动跳转到 /analysis 页面
+        suggestAnalysis: true,
+        suggestAnalysisCode: stockCode,
+      });
+    }
+
+    // ── realtime-only 路由：无 RAG，仅用实时数据回答 ──────────────
+    if (routeDecision.route === 'realtime' && !realtimeData) {
+      // 实时数据获取失败时，降级为 rag 并提示
+      console.warn('[RAG Enhanced] realtime route but no realtimeData, falling back to rag');
+    }
+
+    // ── 合并 config（注入 realtimeData + stockCode） ───────────────
+    const mergedConfig = {
+      ...(config || {}),
+      stockCode: stockCode || config?.stockCode,
+      realtimeData,
+    };
+
     const result = await pipelineService.enhancedQuery({
       question,
       sessionId,
-      config,
+      config: mergedConfig,
       conversationHistory: conversationHistory || [],
       userId,
     });
@@ -910,6 +978,9 @@ rag.post('/query/enhanced', async (c) => {
       sessionId: result.sessionId,
       pipeline: result.pipeline,
       messageLogId: result.messageLogId,
+      // 路由信息透出给前端（便于调试和日志）
+      route: routeDecision.route,
+      routeReason: routeDecision.reason,
     });
   } catch (error) {
     console.error('[RAG Enhanced Query Error]', error);

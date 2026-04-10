@@ -638,10 +638,21 @@ ragEnhance.post('/evaluations/:id/run-one', async (c) => {
     if (!questionId) return c.json({ success: false, error: '缺少 questionId' }, 400);
 
     // Build RAG query function (same as run endpoint)
-    const ragQueryFn = async (question: string, config: any) => {
+    const ragQueryFn = async (questionObj: import('../services/ragTestSet').TestQuestion, config: any) => {
       const start = Date.now();
+
+      // ✅ 修复 Q7 跨公司 chunk 污染：从题目 metadata 中取 stockCode，
+      // 确保 searchSimilar() 只检索该股票的文档，零运维成本
+      let stockCode: string | undefined;
+      try {
+        const meta = JSON.parse(questionObj.metadata || '{}');
+        stockCode = meta.stockCode || meta.stock_code || undefined;
+      } catch {
+        // metadata 解析失败时不传 stockCode，降级为全库检索
+      }
+
       const result = await pipelineService.enhancedQuery({
-        question,
+        question: questionObj.question,
         config: {
           enableBm25: config.searchStrategy !== 'vector',
           enableRerank: config.enableRerank || false,
@@ -649,6 +660,7 @@ ragEnhance.post('/evaluations/:id/run-one', async (c) => {
           minScore: config.minScore || 0.25,
           contextMode: config.contextMode || 'none',
           contextWindow: config.contextWindow ?? 1,
+          stockCode,  // ✅ 传入 stockCode，限定检索范围，彻底解决跨公司污染
         },
       });
 

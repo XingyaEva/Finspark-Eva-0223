@@ -638,4 +638,6 @@ export interface Bindings {
   LANGFUSE_BASE_URL?: string;
   /** Vectorize 向量数据库 (RAG 语义检索, 替代 KV 全扫方案) */
   VECTORIZE?: Vectorize;
+  /** Finspark 服务自身的 Base URL（用于内部 API 调用，如实时行情获取）*/
+  FINSPARK_BASE_URL?: string;
 }
